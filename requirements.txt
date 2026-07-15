@@ -1,0 +1,9 @@
+mlx-whisper>=0.4.0
+sounddevice>=0.4.6
+numpy>=1.26,<2.3
+boto3>=1.34.0
+rumps>=0.4.0
+pyobjc-core>=10.1
+pyobjc-framework-Cocoa>=10.1
+pyobjc-framework-Quartz>=10.1
+py2app>=0.28.10  # build-only: python setup.py py2app -A
