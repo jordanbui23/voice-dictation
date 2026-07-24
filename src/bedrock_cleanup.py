@@ -9,7 +9,7 @@ import json
 import boto3
 from botocore.config import Config as BotoConfig
 
-SYSTEM_PROMPT = (
+_BASE_RULES = (
     "You are a text-cleanup function, NOT an assistant. Your input is dictation "
     "the user just spoke; your output is that same text typed verbatim after "
     "cleanup. You never converse.\n\n"
@@ -24,9 +24,14 @@ SYSTEM_PROMPT = (
     "- If the input is already clean, return it unchanged.\n"
     "- Output ONLY the cleaned text. No preface, no notes, no quotation marks, no "
     "explanation.\n"
+    "- Never use em dashes. Use a comma, a colon, or two separate sentences "
+    "instead.\n"
     "- Fix these technical terms when heard phonetically: AWS, Bedrock, "
-    "CloudFormation, S3, EC2, Lambda, IAM, API, JSON, CLI.\n\n"
-    "Examples:\n"
+    "CloudFormation, S3, EC2, Lambda, IAM, API, JSON, CLI.\n"
+)
+
+_EXAMPLES = (
+    "\nExamples:\n"
     "Input: how do i add this to autostart\n"
     "Output: How do I add this to autostart?\n"
     "Input: um can you clean this up for me\n"
@@ -36,10 +41,41 @@ SYSTEM_PROMPT = (
 )
 
 
+def _names_rule(known_words):
+    if not known_words:
+        return ""
+    parts = []
+    for word in known_words:
+        correct = word.get("correct", "").strip()
+        if not correct:
+            continue
+        variants = [v for v in word.get("sounds_like", []) if v.strip()]
+        if variants:
+            parts.append(f"{correct} (may be heard as {', '.join(variants)})")
+        else:
+            parts.append(correct)
+    if not parts:
+        return ""
+    return (
+        "- Spell these names/words correctly, fixing phonetic mishearings: "
+        + "; ".join(parts)
+        + ".\n"
+    )
+
+
+def build_system_prompt(known_words=None):
+    return _BASE_RULES + _names_rule(known_words or []) + _EXAMPLES
+
+
+SYSTEM_PROMPT = build_system_prompt()
+
+
 class BedrockCleanup:
-    def __init__(self, profile, region, model_id, timeout, max_tokens):
+    def __init__(self, profile, region, model_id, timeout, max_tokens,
+                 known_words=None):
         self.model_id = model_id
         self.max_tokens = max_tokens
+        self.system_prompt = build_system_prompt(known_words or [])
         session = boto3.Session(profile_name=profile, region_name=region)
         boto_cfg = BotoConfig(
             connect_timeout=timeout,
@@ -54,7 +90,7 @@ class BedrockCleanup:
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": self.max_tokens,
             "temperature": 0,
-            "system": SYSTEM_PROMPT,
+            "system": self.system_prompt,
             "messages": [
                 {
                     "role": "user",

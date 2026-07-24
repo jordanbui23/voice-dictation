@@ -14,6 +14,7 @@ DEFAULTS = {
     "cleanup_enabled": True,
     "cleanup_timeout_seconds": 3.0,
     "cleanup_max_tokens": 512,
+    "transcribe_timeout_seconds": 60.0,
     "whisper_model": "mlx-community/whisper-base-mlx",
     "whisper_model_label": "base",
     "hotkey": "right_cmd",
@@ -21,6 +22,11 @@ DEFAULTS = {
     "clipboard_restore_delay": 0.25,
     "stream_interval_seconds": 1.2,
     "stream_debug": False,
+    "known_words": [
+        {"correct": "Dhimu", "sounds_like": ["demu", "dee moo", "the moo"]},
+        {"correct": "Cat", "sounds_like": ["kat"]},
+        {"correct": "Kathryn", "sounds_like": ["catherine", "katherine"]},
+    ],
 }
 
 WHISPER_MODELS = {
@@ -83,3 +89,24 @@ class Config:
             self._data["whisper_model"] = WHISPER_MODELS[label]
             self._data["whisper_model_label"] = label
             self.save()
+
+    def get_known_words(self):
+        """Return the known-words vocabulary list, filtered to valid entries."""
+        raw = self._data.get("known_words", DEFAULTS["known_words"])
+        if not isinstance(raw, list):
+            return []
+        out = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            correct = str(entry.get("correct", "")).strip()
+            if not correct:
+                continue
+            sounds = entry.get("sounds_like", [])
+            if not isinstance(sounds, list):
+                sounds = []
+            out.append({
+                "correct": correct,
+                "sounds_like": [str(s).strip() for s in sounds if str(s).strip()],
+            })
+        return out

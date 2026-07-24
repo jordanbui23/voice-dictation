@@ -21,9 +21,12 @@ _STATE_TEXT = {
     "listening": "🔴  Listening…",
     "transcribing": "⏳  Transcribing…",
     "done": "✓  Done",
+    "auth_needed": "🔑  Auth needed: refresh AWS creds",
+    "error": "⚠️  Transcribe timed out",
 }
 
 _PILL_W = 200.0
+_PILL_W_WIDE = 320.0
 _PILL_H = 44.0
 _TOP_GAP = 8.0
 
@@ -35,17 +38,14 @@ class _OverlayImpl(NSObject):
             return None
         self._window = None
         self._label = None
+        self._content = None
         self._hide_timer = None
         return self
 
     def _ensure_window(self):
         if self._window is not None:
             return
-        screen = NSScreen.mainScreen()
-        frame = screen.frame()
-        x = frame.origin.x + (frame.size.width - _PILL_W) / 2.0
-        y = frame.origin.y + frame.size.height - _PILL_H - _TOP_GAP
-        rect = NSMakeRect(x, y, _PILL_W, _PILL_H)
+        rect = NSMakeRect(0, 0, _PILL_W, _PILL_H)
 
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             rect, NSWindowStyleMaskBorderless, NSBackingStoreBuffered, False
@@ -75,19 +75,43 @@ class _OverlayImpl(NSObject):
         label.setAlignment_(1)  # center
         label.setTextColor_(NSColor.whiteColor())
         label.setFont_(NSFont.systemFontOfSize_weight_(15.0, 0.3))
-        # vertically center-ish
         label.setFrame_(NSMakeRect(0, (_PILL_H - 22) / 2.0, _PILL_W, 22))
         content.addSubview_(label)
+        self._content = label.superview()
         self._label = label
         self._window = win
+
+    def _resize_to(self, width):
+        screen = NSScreen.mainScreen()
+        frame = screen.frame()
+        x = frame.origin.x + (frame.size.width - width) / 2.0
+        y = frame.origin.y + frame.size.height - _PILL_H - _TOP_GAP
+        self._window.setFrame_display_(NSMakeRect(x, y, width, _PILL_H), True)
+        self._content.setFrame_(NSMakeRect(0, 0, width, _PILL_H))
+        self._label.setFrame_(NSMakeRect(0, (_PILL_H - 22) / 2.0, width, 22))
 
     def showState_(self, state):
         self._ensure_window()
         if self._hide_timer is not None:
             self._hide_timer.invalidate()
             self._hide_timer = None
+        self._resize_to(_PILL_W)
         self._label.setStringValue_(_STATE_TEXT.get(state, ""))
         self._window.orderFrontRegardless()
+
+    def showAuthNeeded(self):
+        self._ensure_window()
+        if self._hide_timer is not None:
+            self._hide_timer.invalidate()
+            self._hide_timer = None
+        self._resize_to(_PILL_W_WIDE)
+        self._label.setStringValue_(_STATE_TEXT["auth_needed"])
+        self._window.orderFrontRegardless()
+        self._hide_timer = (
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                4.0, self, "hideNow:", None, False
+            )
+        )
 
     def showDoneThenHide(self):
         self._ensure_window()
@@ -98,6 +122,19 @@ class _OverlayImpl(NSObject):
         self._hide_timer = (
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 0.9, self, "hideNow:", None, False
+            )
+        )
+
+    def showErrorThenHide(self):
+        self._ensure_window()
+        self._resize_to(_PILL_W_WIDE)
+        self._label.setStringValue_(_STATE_TEXT["error"])
+        self._window.orderFrontRegardless()
+        if self._hide_timer is not None:
+            self._hide_timer.invalidate()
+        self._hide_timer = (
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                2.5, self, "hideNow:", None, False
             )
         )
 
@@ -128,6 +165,16 @@ class Overlay:
     def done(self):
         self._impl.performSelectorOnMainThread_withObject_waitUntilDone_(
             "showDoneThenHide", None, False
+        )
+
+    def error(self):
+        self._impl.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "showErrorThenHide", None, False
+        )
+
+    def auth_needed(self):
+        self._impl.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "showAuthNeeded", None, False
         )
 
     def hide(self):

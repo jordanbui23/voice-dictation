@@ -26,6 +26,7 @@ from audio import Recorder
 from bedrock_cleanup import BedrockCleanup, is_auth_error
 from config import Config, WHISPER_MODELS, HOTKEYS, LOG_DIR, STREAM_DEBUG_LOG
 from hotkey import HotkeyListener
+from known_words import apply_corrections, build_whisper_prompt
 from overlay import Overlay
 from paste import paste_text
 from streaming import StreamingSession
@@ -33,6 +34,16 @@ from transcribe import Transcriber
 from type_text import type_text
 
 IDLE_ICON = "🎙️"
+
+_DASH_MAP = str.maketrans({"\u2014": ", ", "\u2013": "-"})
+
+
+def strip_dashes(text):
+    """Replace em dashes with ', ' and en dashes with '-'. Collapse doubles."""
+    out = text.translate(_DASH_MAP)
+    while ",  " in out:
+        out = out.replace(",  ", ", ")
+    return out.replace(" , ", ", ")
 
 HOTKEY_LABELS = {
     "right_cmd": "Right Command",
@@ -49,8 +60,12 @@ class DictationApp(rumps.App):
     def __init__(self):
         super().__init__("VoiceDictation", title=IDLE_ICON, quit_button=None)
         self.cfg = Config()
+        self.known_words = self.cfg.get_known_words()
         self.recorder = Recorder(self.cfg.get_int("sample_rate"))
-        self.transcriber = Transcriber(self.cfg.get("whisper_model"))
+        self.transcriber = Transcriber(
+            self.cfg.get("whisper_model"),
+            initial_prompt=build_whisper_prompt(self.known_words),
+        )
         self.cleanup_client = None
         self._recording = False
         self._streaming_session = None
@@ -118,6 +133,7 @@ class DictationApp(rumps.App):
                 self.cfg.get("bedrock_model_id"),
                 self.cfg.get("cleanup_timeout_seconds"),
                 self.cfg.get("cleanup_max_tokens"),
+                known_words=self.known_words,
             )
         except Exception as e:
             self.cleanup_client = None
@@ -151,7 +167,10 @@ class DictationApp(rumps.App):
             f"Loading {label}…" if cached else f"Downloading {label} model…"
         )
         try:
-            new_transcriber = Transcriber(self.cfg.get("whisper_model"))
+            new_transcriber = Transcriber(
+                self.cfg.get("whisper_model"),
+                initial_prompt=build_whisper_prompt(self.known_words),
+            )
             new_transcriber.warm_up()
             self.transcriber = new_transcriber
             self.status_item.title = "Ready"
@@ -224,7 +243,14 @@ class DictationApp(rumps.App):
         try:
             if self._streaming_mode():
                 dbg = self._stream_debug()
-                emit = (lambda text: type_text(text, debug=dbg)) if dbg else type_text
+                base_emit = (
+                    (lambda text: type_text(text, debug=dbg)) if dbg else type_text
+                )
+                kw = self.known_words
+
+                def emit(text, _base=base_emit, _kw=kw):
+                    _base(apply_corrections(text, _kw))
+
                 self._streaming_session = StreamingSession(
                     self.recorder,
                     self.transcriber,
@@ -299,7 +325,10 @@ class DictationApp(rumps.App):
 
     def _process(self):
         if not self._worker_lock.acquire(blocking=False):
+            self.overlay.hide()
             return
+        auth_needed = False
+        timed_out = False
         try:
             audio = self.recorder.stop()
             diag = self.recorder.diagnostics(audio)
@@ -308,7 +337,19 @@ class DictationApp(rumps.App):
                 self.overlay.hide()
                 return
 
-            raw = self.transcriber.transcribe(audio)
+            try:
+                raw = self.transcriber.transcribe_with_timeout(
+                    audio, self.cfg.get_float("transcribe_timeout_seconds")
+                )
+            except TimeoutError as e:
+                timed_out = True
+                self._log_event("transcribe_timeout", error=str(e), **diag)
+                rumps.notification(
+                    "Voice Dictation",
+                    "Transcription timed out",
+                    "The clip was too long or Whisper stalled. Try again.",
+                )
+                return
             if not raw:
                 self._log_event("dictation_discarded", reason="empty_transcript", **diag)
                 self.overlay.hide()
@@ -317,6 +358,7 @@ class DictationApp(rumps.App):
             final_text = raw
             used_cleanup = False
             cleanup_error = None
+            auth_needed = False
 
             if self.cfg.get("cleanup_enabled") and self.cleanup_client is not None:
                 t0 = time.time()
@@ -327,15 +369,18 @@ class DictationApp(rumps.App):
                     cleanup_error = str(e)
                     final_text = raw
                     if is_auth_error(e):
+                        auth_needed = True
                         self._alert_auth_expired()
                     else:
                         rumps.notification(
                             "Voice Dictation",
-                            "Cleanup unavailable — pasted raw transcript",
+                            "Cleanup unavailable, pasted raw transcript",
                             (str(e)[:120]),
                         )
                 _ = time.time() - t0
 
+            final_text = apply_corrections(final_text, self.known_words)
+            final_text = strip_dashes(final_text)
             paste_text(final_text, self.cfg.get_float("clipboard_restore_delay"))
             self._log_event(
                 "dictation",
@@ -349,7 +394,12 @@ class DictationApp(rumps.App):
             self._log_event("process_failed", error=str(e))
             rumps.notification("Voice Dictation", "Dictation failed", str(e)[:120])
         finally:
-            self.overlay.done()
+            if timed_out:
+                self.overlay.error()
+            elif auth_needed:
+                self.overlay.auth_needed()
+            else:
+                self.overlay.done()
             self._worker_lock.release()
 
     # ---------- logging ----------
