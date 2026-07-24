@@ -16,8 +16,11 @@ class Transcriber:
             self._mlx = mlx_whisper
         return self._mlx
 
-    def _prompt_kwargs(self):
-        return {"initial_prompt": self.initial_prompt} if self.initial_prompt else {}
+    def _decode_kwargs(self):
+        kwargs = {"temperature": 0.0, "condition_on_previous_text": False}
+        if self.initial_prompt:
+            kwargs["initial_prompt"] = self.initial_prompt
+        return kwargs
 
     def warm_up(self):
         """Force model download/load so first real dictation isn't slow."""
@@ -34,7 +37,7 @@ class Transcriber:
             audio_f32_mono_16k,
             path_or_hf_repo=self.model_repo,
             fp16=True,
-            **self._prompt_kwargs(),
+            **self._decode_kwargs(),
         )
         return result.get("text", "").strip()
 
@@ -79,7 +82,7 @@ class Transcriber:
             path_or_hf_repo=self.model_repo,
             fp16=True,
             word_timestamps=True,
-            **self._prompt_kwargs(),
+            **self._decode_kwargs(),
         )
         words = []
         for seg in result.get("segments", []):
