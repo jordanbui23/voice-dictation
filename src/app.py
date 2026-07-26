@@ -68,6 +68,7 @@ class DictationApp(rumps.App):
         )
         self.cleanup_client = None
         self._recording = False
+        self._processing = False
         self._streaming_session = None
         self._auth_alert_open = False
         self._worker_lock = threading.Lock()
@@ -252,6 +253,8 @@ class DictationApp(rumps.App):
     def _on_press(self):
         if self._recording:
             return
+        if self._processing:
+            return
         if self._streaming_session is not None:
             self._streaming_session.request_stop()
             return
@@ -307,6 +310,7 @@ class DictationApp(rumps.App):
             return
         self._recording = False
         self.overlay.show_state("transcribing")
+        self._processing = True
         session = self._streaming_session
         if session is not None:
             session.request_stop()
@@ -320,6 +324,7 @@ class DictationApp(rumps.App):
         session = self._streaming_session
         self._streaming_session = None
         if session is None:
+            self._processing = False
             self.overlay.hide()
             return
         self._worker_lock.acquire()
@@ -338,6 +343,7 @@ class DictationApp(rumps.App):
             rumps.notification("Voice Dictation", "Dictation failed", str(e)[:120])
         finally:
             self.overlay.done()
+            self._processing = False
             self._worker_lock.release()
 
     def _process(self):
@@ -417,6 +423,7 @@ class DictationApp(rumps.App):
                 self.overlay.auth_needed()
             else:
                 self.overlay.done()
+            self._processing = False
             self._worker_lock.release()
 
     # ---------- logging ----------
