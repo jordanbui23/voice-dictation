@@ -10,6 +10,7 @@ STREAM_DEBUG_LOG = os.path.join(LOG_DIR, "stream_debug.log")
 DEFAULTS = {
     "aws_profile": "default",
     "aws_region": "us-west-2",
+    "path_prepend": [],
     "bedrock_model_id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
     "cleanup_enabled": True,
     "cleanup_timeout_seconds": 3.0,

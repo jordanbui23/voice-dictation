@@ -76,6 +76,7 @@ class DictationApp(rumps.App):
         self.transcript_log = os.path.join(LOG_DIR, "transcripts.jsonl")
 
         self._build_menu()
+        self._extend_path()
         self._init_cleanup_client()
 
         self.listener = HotkeyListener(
@@ -125,6 +126,17 @@ class DictationApp(rumps.App):
             rumps.MenuItem("Quit", callback=self._quit),
         ]
 
+    def _extend_path(self):
+        extra = self.cfg.get("path_prepend") or []
+        if isinstance(extra, str):
+            extra = [extra]
+        dirs = [os.path.expanduser(str(p)) for p in extra if str(p).strip()]
+        if not dirs:
+            return
+        current = os.environ.get("PATH", "").split(os.pathsep)
+        merged = dirs + [p for p in current if p not in dirs]
+        os.environ["PATH"] = os.pathsep.join(merged)
+
     def _init_cleanup_client(self):
         try:
             self.cleanup_client = BedrockCleanup(
@@ -138,11 +150,16 @@ class DictationApp(rumps.App):
         except Exception as e:
             self.cleanup_client = None
             self._log_event("bedrock_init_failed", error=str(e))
+            if self.cfg.get("cleanup_enabled"):
+                self.title = f"{IDLE_ICON}\u26a0\ufe0f"
+                self.status_item.title = f"Cleanup unavailable: {e}"
 
     def _warm_up(self):
         try:
             self.status_item.title = "Loading Whisper model…"
             self.transcriber.warm_up()
+            if self.cleanup_client is None and self.cfg.get("cleanup_enabled"):
+                return
             self.status_item.title = "Ready"
         except Exception as e:
             self.status_item.title = f"Model load failed: {e}"
