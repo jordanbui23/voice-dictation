@@ -55,15 +55,42 @@ class Recorder:
             frames = list(self._frames)
         return np.concatenate(frames, axis=0).reshape(-1).astype(np.float32)
 
+    def _teardown_stream(self, stream, timeout_s=2.0):
+        """Stop and close a PortAudio stream, abandoning it if it wedges.
+
+        _stream.stop()/close() are native CoreAudio calls that can block
+        indefinitely when the mic device is in a bad state. A wedged call here
+        used to latch the app's processing flag forever. Run it on a daemon
+        thread and join with a timeout; if it doesn't return, drop the reference
+        (the thread dies with the app) so the next start() creates a fresh stream.
+        """
+        if stream is None:
+            return
+
+        def run():
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout_s)
+        if worker.is_alive():
+            self._status_flags.append(f"stream_teardown_timeout_{timeout_s}s")
+
     def stop(self):
-        """Stop capture, return 1-D float32 mono array (empty if nothing recorded)."""
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        """Stop capture, return 1-D float32 mono array (empty if nothing recorded).
+
+        Frames are salvaged BEFORE stream teardown so a wedged stop/close still
+        yields whatever audio was captured instead of dropping the clip.
+        """
         with self._lock:
             frames = list(self._frames)
             self._frames = []
+        stream, self._stream = self._stream, None
+        self._teardown_stream(stream)
         if not frames:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(frames, axis=0).reshape(-1).astype(np.float32)
