@@ -20,6 +20,7 @@ from Foundation import NSMakeRect, NSObject, NSTimer
 _STATE_TEXT = {
     "listening": "🔴  Listening…",
     "transcribing": "⏳  Transcribing…",
+    "busy": "⏳  Still working…",
     "done": "✓  Done",
     "auth_needed": "🔑  Auth needed: refresh AWS creds",
     "error": "⚠️  Transcribe timed out",

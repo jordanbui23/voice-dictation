@@ -75,6 +75,7 @@ class DictationApp(rumps.App):
         self.overlay = Overlay()
         os.makedirs(LOG_DIR, exist_ok=True)
         self.transcript_log = os.path.join(LOG_DIR, "transcripts.jsonl")
+        self.trace_log = os.path.join(LOG_DIR, "lifecycle.jsonl")
 
         self._build_menu()
         self._extend_path()
@@ -250,15 +251,30 @@ class DictationApp(rumps.App):
     def _streaming_mode(self):
         return not self.cfg.get("cleanup_enabled")
 
+    def _trace(self, stage, **fields):
+        rec = {"ts": datetime.now().isoformat(), "stage": stage,
+               "recording": self._recording, "processing": self._processing}
+        rec.update(fields)
+        try:
+            with open(self.trace_log, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+        except OSError:
+            pass
+
     def _on_press(self):
         if self._recording:
+            self._trace("press_ignored", why="already_recording")
             return
         if self._processing:
+            self._trace("press_ignored", why="processing_busy")
+            self.overlay.show_state("busy")
             return
         if self._streaming_session is not None:
+            self._trace("press_stop_stream")
             self._streaming_session.request_stop()
             return
         self._recording = True
+        self._trace("press")
         self.overlay.show_state("listening")
         try:
             if self._streaming_mode():
@@ -307,15 +323,18 @@ class DictationApp(rumps.App):
 
     def _on_release(self):
         if not self._recording:
+            self._trace("release_ignored", why="not_recording")
             return
         self._recording = False
         self.overlay.show_state("transcribing")
         self._processing = True
         session = self._streaming_session
         if session is not None:
+            self._trace("release_stream")
             session.request_stop()
             threading.Thread(target=self._finish_stream, daemon=True).start()
         else:
+            self._trace("release_batch")
             threading.Thread(target=self._process, daemon=True).start()
 
     # ---------- worker ----------
@@ -348,22 +367,29 @@ class DictationApp(rumps.App):
 
     def _process(self):
         if not self._worker_lock.acquire(blocking=False):
+            self._trace("process_lock_busy")
+            self._processing = False
             self.overlay.hide()
             return
         auth_needed = False
         timed_out = False
         try:
+            self._trace("process_enter")
             audio = self.recorder.stop()
             diag = self.recorder.diagnostics(audio)
+            self._trace("recorder_stopped", captured_s=diag.get("captured_s"),
+                        hold_s=diag.get("hold_s"))
             if audio.size < self.cfg.get_int("sample_rate") * 0.2:
                 self._log_event("dictation_discarded", reason="too_short", **diag)
                 self.overlay.hide()
                 return
 
+            self._trace("transcribe_enter")
             try:
                 raw = self.transcriber.transcribe_with_timeout(
                     audio, self.cfg.get_float("transcribe_timeout_seconds")
                 )
+                self._trace("transcribe_return", chars=len(raw) if raw else 0)
             except TimeoutError as e:
                 timed_out = True
                 self._log_event("transcribe_timeout", error=str(e), **diag)
@@ -404,7 +430,9 @@ class DictationApp(rumps.App):
 
             final_text = apply_corrections(final_text, self.known_words)
             final_text = strip_dashes(final_text)
+            self._trace("paste_enter", cleanup=used_cleanup)
             paste_text(final_text, self.cfg.get_float("clipboard_restore_delay"))
+            self._trace("paste_return")
             self._log_event(
                 "dictation",
                 raw=raw,
@@ -425,6 +453,7 @@ class DictationApp(rumps.App):
                 self.overlay.done()
             self._processing = False
             self._worker_lock.release()
+            self._trace("process_exit")
 
     # ---------- logging ----------
 
