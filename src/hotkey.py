@@ -9,6 +9,7 @@ marshals real work onto a worker thread so we never block the tap (which would m
 the whole system's input laggy).
 """
 import threading
+import time
 
 import Quartz
 
@@ -41,6 +42,21 @@ def _combo_pressed(flags, parts):
     return True
 
 
+def _generic_masks(hotkey):
+    """Generic modifier masks a hotkey uses (left/right agnostic).
+
+    CGEventSourceFlagsState carries only generic masks, not the device-specific
+    right-side bits, so the stuck-release poll compares against these.
+    """
+    if hotkey in _MODIFIER_COMBOS:
+        parts = _MODIFIER_COMBOS[hotkey]
+    elif hotkey in _MODIFIER_HOTKEYS:
+        parts = [hotkey]
+    else:
+        return []
+    return [_MODIFIER_HOTKEYS[p][0] for p in parts]
+
+
 class HotkeyListener:
     def __init__(self, hotkey, on_press, on_release):
         self.hotkey = hotkey
@@ -51,14 +67,24 @@ class HotkeyListener:
         self._runloop_source = None
         self._loop = None
         self._thread = None
+        self._generic_masks = _generic_masks(hotkey)
+        self._press_time = 0.0
+        self._watchdog = None
+        self._watchdog_stop = threading.Event()
 
     def _handle(self, proxy, etype, event, refcon):
+        if etype in (Quartz.kCGEventTapDisabledByTimeout,
+                     Quartz.kCGEventTapDisabledByUserInput):
+            if self._tap is not None:
+                Quartz.CGEventTapEnable(self._tap, True)
+            return event
         try:
             if self.hotkey in _MODIFIER_COMBOS:
                 flags = Quartz.CGEventGetFlags(event)
                 pressed = _combo_pressed(flags, _MODIFIER_COMBOS[self.hotkey])
                 if pressed and not self._down:
                     self._down = True
+                    self._press_time = time.monotonic()
                     self.on_press()
                 elif not pressed and self._down:
                     self._down = False
@@ -69,6 +95,7 @@ class HotkeyListener:
                 pressed = bool(flags & generic_mask) and bool(flags & device_mask)
                 if pressed and not self._down:
                     self._down = True
+                    self._press_time = time.monotonic()
                     self.on_press()
                 elif not pressed and self._down:
                     self._down = False
@@ -80,6 +107,7 @@ class HotkeyListener:
                 if keycode == _KEYCODES.get(self.hotkey):
                     if etype == Quartz.kCGEventKeyDown and not self._down:
                         self._down = True
+                        self._press_time = time.monotonic()
                         self.on_press()
                     elif etype == Quartz.kCGEventKeyUp and self._down:
                         self._down = False
@@ -88,6 +116,39 @@ class HotkeyListener:
         except Exception:
             pass
         return event
+
+    def _watch(self):
+        """Recover a stuck press when the release event was lost.
+
+        CGEventSourceFlagsState only carries generic modifier masks, so this
+        checks whether ALL of the hotkey's generic modifiers have gone absent.
+        That can only ever recover a genuinely stuck state, never interrupt an
+        active hold, so there is no cap on recording length. Requires two
+        consecutive absent readings and >=1s since press to avoid a startup race.
+        """
+        absent_streak = 0
+        while not self._watchdog_stop.wait(0.15):
+            if not self._down:
+                absent_streak = 0
+                continue
+            if time.monotonic() - self._press_time < 1.0:
+                absent_streak = 0
+                continue
+            flags = Quartz.CGEventSourceFlagsState(
+                Quartz.kCGEventSourceStateCombinedSessionState
+            )
+            all_absent = all(not (flags & m) for m in self._generic_masks)
+            if not all_absent:
+                absent_streak = 0
+                continue
+            absent_streak += 1
+            if absent_streak >= 2 and self._down:
+                self._down = False
+                absent_streak = 0
+                try:
+                    self.on_release()
+                except Exception:
+                    pass
 
     def _run(self):
         if self.hotkey in _MODIFIER_COMBOS or self.hotkey in _MODIFIER_HOTKEYS:
@@ -125,7 +186,12 @@ class HotkeyListener:
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        if self._generic_masks:
+            self._watchdog_stop.clear()
+            self._watchdog = threading.Thread(target=self._watch, daemon=True)
+            self._watchdog.start()
 
     def stop(self):
+        self._watchdog_stop.set()
         if self._loop is not None:
             Quartz.CFRunLoopStop(self._loop)
