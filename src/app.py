@@ -61,7 +61,10 @@ class DictationApp(rumps.App):
         super().__init__("VoiceDictation", title=IDLE_ICON, quit_button=None)
         self.cfg = Config()
         self.known_words = self.cfg.get_known_words()
-        self.recorder = Recorder(self.cfg.get_int("sample_rate"))
+        self.recorder = Recorder(
+            self.cfg.get_int("sample_rate"),
+            on_no_callbacks=self._on_mic_stuck,
+        )
         self.transcriber = Transcriber(
             self.cfg.get("whisper_model"),
             initial_prompt=build_whisper_prompt(self.known_words),
@@ -320,6 +323,21 @@ class DictationApp(rumps.App):
                 pass
 
         return log
+
+    def _on_mic_stuck(self):
+        """Recorder watchdog fired: the mic stream started but delivered no audio.
+
+        Runs on the recorder's watchdog thread. Warn the user mid-recording so
+        they stop talking and retry, instead of silently losing the whole take
+        to the too-short discard.
+        """
+        self._trace("mic_stuck")
+        self.overlay.error()
+        rumps.notification(
+            "Voice Dictation",
+            "Mic not capturing",
+            "Release and try again -- the microphone stalled.",
+        )
 
     def _on_release(self):
         if not self._recording:
