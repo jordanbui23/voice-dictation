@@ -137,9 +137,10 @@ class Recorder:
             worker = threading.Thread(target=run, daemon=True)
             worker.start()
             worker.join(2.0)
-            if not worker.is_alive():
+            if worker.is_alive():
                 with self._lock:
-                    self._needs_reset = False
+                    self._status_flags.append("recover_terminate_timeout")
+                    self._needs_reset = True
         finally:
             self._reset_lock.release()
 
@@ -224,6 +225,9 @@ class Recorder:
         with self._lock:
             frames = list(self._frames)
             self._frames = []
+            if self._callback_count == 0 and self._start_time is not None:
+                self._status_flags.append("no_callbacks_at_stop")
+                self._needs_reset = True
             self._generation += 1
         stream, self._stream = self._stream, None
         self._teardown_stream(stream)
