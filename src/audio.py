@@ -1,236 +1,278 @@
-"""Push-to-talk audio capture via sounddevice. 16kHz mono float32.
+"""Push-to-talk audio capture via an isolated subprocess. 16kHz mono float32.
 
-Supports two read modes:
-- stop(): batch mode — end capture, return the whole clip.
-- snapshot(): streaming mode — return the audio-so-far WITHOUT stopping, so a
-  sliding-window transcriber can re-decode the growing buffer while recording.
+The sounddevice InputStream runs in a child process (audio_capture_child.py), NOT
+in this process. Frames cross into the parent through a preallocated shared-memory
+ring; the child signals new write positions over a control pipe. This process only
+copies float32 samples out of the ring -- it never touches PortAudio -- so a wedged
+native CoreAudio call can no longer hang or poison THIS process. Recovery is a
+SIGKILL + respawn of the child, which is the only thing that reliably frees a mic
+device stuck in a native abort()/close(); killing a process reclaims the device via
+the OS instead of racing a live native pointer (which an in-process sd._terminate()
+would do -> use-after-free -> segfault).
 
-Also records diagnostics (wall-clock hold time, captured seconds, callback count,
-and any sounddevice status/overflow flags) so a short/garbled capture can be
-diagnosed as early-release vs. mic dropout vs. Whisper mis-transcription.
+API preserved for streaming.py / app.py:
+- start()      -> bool: begin capture. False if the device could not be brought up
+                  (child wedged / respawn failed) so the caller aborts the take.
+- snapshot()   -> 1-D float32 of audio-so-far, WITHOUT stopping (streaming mode).
+- stop()       -> 1-D float32 of the whole take (empty if nothing captured).
+- diagnostics(audio) -> dict for logging (captured_s vs hold_s, peak/rms, flags).
 """
+import multiprocessing as mp
 import threading
 import time
 
 import numpy as np
-import sounddevice as sd
+
+DEFAULT_SAMPLE_RATE = 16000
+RING_SECONDS = 300
+HEALTH_CHECK_S = 0.3
+RESPAWN_ATTEMPTS = 2
 
 
 class Recorder:
-    def __init__(self, sample_rate=16000, on_no_callbacks=None, health_check_s=0.3):
+    def __init__(self, sample_rate=DEFAULT_SAMPLE_RATE, on_no_callbacks=None,
+                 health_check_s=HEALTH_CHECK_S):
         self.sample_rate = sample_rate
-        self._frames = []
-        self._lock = threading.Lock()
-        self._stream = None
-        self._start_time = None
-        self._callback_count = 0
-        self._status_flags = []
+        self._ring_samples = int(RING_SECONDS * sample_rate)
         self._on_no_callbacks = on_no_callbacks
         self._health_check_s = health_check_s
+
+        self._ctx = mp.get_context("spawn")
+        self._lock = threading.Lock()
+        self._frames = []
+        self._read_index = 0
+        self._write_index = 0
+        self._callback_count = 0
+        self._status_flags = []
+        self._start_time = None
+        self._recording = False
         self._generation = 0
-        self._needs_reset = False
-        self._reset_lock = threading.Lock()
-        self._teardown_threads = []
-        self._start_retries = 3
 
-    def _callback(self, indata, frames, time_info, status):
-        if status:
-            self._status_flags.append(str(status))
-        with self._lock:
-            self._frames.append(indata.copy())
-            self._callback_count += 1
+        self._proc = None
+        self._conn = None
+        self._shm = None
+        self._ring = None
+        self._pump_thread = None
 
-    def _default_input_device(self):
+    def _spawn_child(self):
+        """Create shared memory + child process. Returns True once child is READY."""
+        from multiprocessing import shared_memory
+
         try:
-            return sd.default.device[0]
-        except (TypeError, IndexError):
-            return sd.default.device
+            shm = shared_memory.SharedMemory(
+                create=True, size=self._ring_samples * 4
+            )
+        except Exception:
+            return False
+        ring = np.ndarray((self._ring_samples,), dtype=np.float32, buffer=shm.buf)
+        parent_conn, child_conn = self._ctx.Pipe()
+        proc = self._ctx.Process(
+            target=_child_entry,
+            args=(shm.name, self._ring_samples, self.sample_rate, child_conn),
+            daemon=True,
+        )
+        proc.start()
+        child_conn.close()
 
-    def _watchdog(self, generation, stream):
-        """Detect a poisoned device: a stream that starts but delivers no audio.
-
-        After a wedged teardown the mic device can stay held by an abandoned
-        stream, so a fresh InputStream starts cleanly yet never fires _callback.
-        The clip is then silently discarded as too-short. Catch it early: if no
-        callbacks arrived within health_check_s, try re-opening the stream a few
-        times (the device sometimes frees once the abandoned abort() lands),
-        flagging the device for a full PortAudio reset on the next start(). Runs
-        on its own daemon thread, so the re-open attempts never block the hotkey
-        thread. If audio never returns, tear the dead stream down and notify the
-        app so the user retries instead of losing the whole take.
-        """
-        time.sleep(self._health_check_s)
-        with self._lock:
-            if generation != self._generation:
-                return
-            if self._callback_count > 0:
-                return
-            self._status_flags.append("no_callbacks")
-            self._needs_reset = True
-
-        for attempt in range(self._start_retries):
-            with self._lock:
-                if generation != self._generation:
-                    return
-                dead, self._stream = self._stream, None
-            self._teardown_stream(dead, timeout_s=1.0)
-            with self._lock:
-                if generation != self._generation:
-                    return
-                self._status_flags.append(f"watchdog_retry_{attempt + 1}")
-            try:
-                new_stream = self._open_stream(generation)
-            except Exception:
-                break
-            with self._lock:
-                if generation != self._generation:
-                    stream = new_stream
+        ready = False
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if parent_conn.poll(deadline - time.time()):
+                try:
+                    msg = parent_conn.recv()
+                except EOFError:
                     break
-                self._stream = stream = new_stream
-                self._start_time = time.time()
+                if msg and msg[0] == "READY":
+                    ready = True
+                    break
+                if msg and msg[0] == "ERROR":
+                    break
+            else:
+                break
+        if not ready:
+            self._kill_child(proc, parent_conn, shm)
+            return False
+
+        self._proc, self._conn, self._shm, self._ring = proc, parent_conn, shm, ring
+        return True
+
+    def _kill_child(self, proc=None, conn=None, shm=None):
+        proc = proc if proc is not None else self._proc
+        conn = conn if conn is not None else self._conn
+        shm = shm if shm is not None else self._shm
+        is_current = proc is self._proc
+        if proc is not None and proc.is_alive():
+            proc.kill()
+            proc.join(1.0)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if shm is not None:
+            try:
+                shm.close()
+                shm.unlink()
+            except Exception:
+                pass
+        if is_current:
+            self._proc = self._conn = self._shm = self._ring = None
+
+    def _pump(self, generation, conn):
+        """Drain control-pipe messages into shared state until generation changes.
+
+        Advancing _write_index here (never in snapshot/stop) means a late message
+        from a killed child's generation is ignored: the guard drops any message
+        once _generation has moved on, so a respawned child cannot have its frames
+        corrupted by the dead one.
+        """
+        while True:
+            with self._lock:
+                if generation != self._generation:
+                    return
+            try:
+                if not conn.poll(0.2):
+                    continue
+                msg = conn.recv()
+            except (EOFError, OSError):
+                return
+            with self._lock:
+                if generation != self._generation:
+                    return
+                tag = msg[0]
+                if tag == "F":
+                    self._write_index = msg[1]
+                    self._callback_count = msg[2]
+                elif tag == "S":
+                    self._status_flags.append(msg[1])
+                elif tag == "ERROR":
+                    self._status_flags.append(f"child_error:{msg[1]}")
+
+    def _drain_ring(self):
+        """Copy [read_index, write_index) out of the ring into _frames. Caller
+        holds _lock. Handles wrap; flags an overrun if the unread span exceeds the
+        ring (should never happen at 0.5s drain cadence with a 5-min ring)."""
+        if self._ring is None:
+            return
+        write = self._write_index
+        avail = write - self._read_index
+        if avail <= 0:
+            return
+        if avail > self._ring_samples:
+            self._status_flags.append("ring_overrun")
+            self._read_index = write - self._ring_samples
+            avail = self._ring_samples
+        start = self._read_index % self._ring_samples
+        end = start + avail
+        if end <= self._ring_samples:
+            self._frames.append(self._ring[start:end].copy())
+        else:
+            first = self._ring_samples - start
+            self._frames.append(self._ring[start:].copy())
+            self._frames.append(self._ring[: avail - first].copy())
+        self._read_index = write
+
+    def _watchdog(self, generation):
+        """Detect a child that started but delivers no frames, and respawn it.
+
+        A wedged mic device is exactly the case where the fresh InputStream opens
+        but never fires a callback, so no ("F", ...) ever arrives and callback_count
+        stays 0. After health_check_s with no frames, SIGKILL the child (freeing the
+        device) and respawn, preserving the parent-held _frames buffer so audio
+        captured before a mid-record wedge survives. If frames never come back,
+        notify the app so the user re-holds instead of losing the take silently.
+        """
+        for attempt in range(RESPAWN_ATTEMPTS + 1):
             time.sleep(self._health_check_s)
             with self._lock:
                 if generation != self._generation:
                     return
                 if self._callback_count > 0:
-                    self._needs_reset = False
                     return
+                self._status_flags.append(f"no_frames_respawn_{attempt + 1}")
+            if attempt == RESPAWN_ATTEMPTS:
+                break
+            self._kill_child()
+            if not self._spawn_child():
+                continue
+            with self._lock:
+                if generation != self._generation:
+                    return
+                self._resume_child()
 
         with self._lock:
-            if self._stream is stream:
-                self._stream = None
-        self._teardown_stream(stream, timeout_s=1.0)
-        if self._on_no_callbacks is not None:
+            still_dead = self._callback_count == 0 and generation == self._generation
+        if still_dead and self._on_no_callbacks is not None:
             try:
                 self._on_no_callbacks()
             except Exception:
                 pass
 
-    def _recover_device(self):
-        """Release a mic device poisoned by an abandoned/wedged stream.
-
-        Tiered so the heavy global PortAudio re-init only runs when it is safe.
-        A prior teardown that wedged in CoreAudio leaves the device held; the
-        next InputStream then opens "successfully" but never fires _callback.
-        We must not run sd._terminate() while an orphaned abort()/close()
-        thread is still alive on that device -- terminate frees the stream out
-        from under it, and the orphan's pending native close() then runs on
-        freed state (segfault). So: only re-init when no teardown orphan is
-        alive; otherwise defer and let a bounded start() retry try to recover.
-        """
-        with self._lock:
-            if not self._needs_reset:
-                return
-            orphan_alive = any(t.is_alive() for t in self._teardown_threads)
-        if orphan_alive:
-            return
-        if not self._reset_lock.acquire(blocking=False):
-            return
-        try:
-            def run():
-                try:
-                    sd._terminate()
-                    sd._initialize()
-                except Exception:
-                    pass
-
-            worker = threading.Thread(target=run, daemon=True)
-            worker.start()
-            worker.join(2.0)
-            if worker.is_alive():
-                with self._lock:
-                    self._status_flags.append("recover_terminate_timeout")
-                    self._needs_reset = True
-        finally:
-            self._reset_lock.release()
-
-    def _open_stream(self, generation):
-        with self._lock:
-            self._frames = []
-            self._callback_count = 0
-        stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=1,
-            dtype="float32",
-            device=self._default_input_device(),
-            latency="high",
-            callback=self._callback,
+    def _resume_child(self):
+        """Start the pump thread for the current child. Caller holds _lock."""
+        conn, gen = self._conn, self._generation
+        self._pump_thread = threading.Thread(
+            target=self._pump, args=(gen, conn), daemon=True
         )
-        stream.start()
-        return stream
+        self._pump_thread.start()
 
     def start(self):
-        self._recover_device()
+        if self._proc is not None:
+            self._kill_child()
         with self._lock:
             self._frames = []
+            self._read_index = 0
+            self._write_index = 0
             self._callback_count = 0
             self._status_flags = []
             self._generation += 1
             generation = self._generation
         self._start_time = time.time()
-        self._stream = self._open_stream(generation)
+        if not self._spawn_child():
+            with self._lock:
+                self._status_flags = ["child_spawn_failed"]
+            if self._on_no_callbacks is not None:
+                try:
+                    self._on_no_callbacks()
+                except Exception:
+                    pass
+            return False
+        with self._lock:
+            self._recording = True
+            self._resume_child()
         threading.Thread(
-            target=self._watchdog,
-            args=(generation, self._stream),
-            daemon=True,
+            target=self._watchdog, args=(generation,), daemon=True
         ).start()
+        return True
 
     def snapshot(self):
         """Return audio captured so far as 1-D float32, WITHOUT stopping capture."""
         with self._lock:
+            self._drain_ring()
             if not self._frames:
                 return np.zeros(0, dtype=np.float32)
-            frames = list(self._frames)
-        return np.concatenate(frames, axis=0).reshape(-1).astype(np.float32)
-
-    def _teardown_stream(self, stream, timeout_s=2.0):
-        """Abort and close a PortAudio stream, abandoning it if it wedges.
-
-        _stream.abort()/close() are native CoreAudio calls that can block
-        indefinitely when the mic device is in a bad state. A wedged call here
-        used to latch the app's processing flag forever. abort() discards
-        buffered audio and returns faster than stop() (which drains) -- frames
-        are already salvaged before teardown, so draining buys nothing. Run it
-        on a daemon thread and join with a timeout; if it doesn't return, drop
-        the reference (the thread dies with the app) so the next start()
-        creates a fresh stream.
-        """
-        if stream is None:
-            return
-
-        def run():
-            try:
-                stream.abort()
-                stream.close()
-            except Exception:
-                pass
-
-        worker = threading.Thread(target=run, daemon=True)
-        worker.start()
-        with self._lock:
-            self._teardown_threads = [t for t in self._teardown_threads if t.is_alive()]
-            self._teardown_threads.append(worker)
-        worker.join(timeout_s)
-        if worker.is_alive():
-            self._status_flags.append(f"stream_teardown_timeout_{timeout_s}s")
-            with self._lock:
-                self._needs_reset = True
+            return np.concatenate(self._frames, axis=0).reshape(-1).astype(np.float32)
 
     def stop(self):
         """Stop capture, return 1-D float32 mono array (empty if nothing recorded).
 
-        Frames are salvaged BEFORE stream teardown so a wedged stop/close still
-        yields whatever audio was captured instead of dropping the clip.
+        Frames are drained from the ring BEFORE the child is killed, so the whole
+        take is preserved even if the child was mid-callback.
         """
         with self._lock:
+            self._drain_ring()
             frames = list(self._frames)
             self._frames = []
             if self._callback_count == 0 and self._start_time is not None:
                 self._status_flags.append("no_callbacks_at_stop")
-                self._needs_reset = True
+            self._recording = False
             self._generation += 1
-        stream, self._stream = self._stream, None
-        self._teardown_stream(stream)
+        if self._conn is not None:
+            try:
+                self._conn.send("stop")
+            except Exception:
+                pass
+        self._kill_child()
         if not frames:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(frames, axis=0).reshape(-1).astype(np.float32)
@@ -254,3 +296,9 @@ class Recorder:
             "peak": round(peak, 4),
             "rms": round(rms, 5),
         }
+
+
+def _child_entry(shm_name, ring_samples, sample_rate, conn):
+    from audio_capture_child import run
+
+    run(shm_name, ring_samples, sample_rate, conn)

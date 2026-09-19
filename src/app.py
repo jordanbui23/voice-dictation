@@ -298,10 +298,17 @@ class DictationApp(rumps.App):
                     interval=self.cfg.get_float("stream_interval_seconds"),
                     debug=dbg,
                 )
-                self.recorder.start()
+                if not self.recorder.start():
+                    self._recording = False
+                    self._streaming_session = None
+                    self._log_event("record_start_aborted", reason="device_wedged")
+                    return
                 self._streaming_session.start()
             else:
-                self.recorder.start()
+                if not self.recorder.start():
+                    self._recording = False
+                    self._log_event("record_start_aborted", reason="device_wedged")
+                    return
         except Exception as e:
             self._recording = False
             self._streaming_session = None
