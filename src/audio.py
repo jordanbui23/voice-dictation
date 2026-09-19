@@ -32,21 +32,22 @@ RESPAWN_ATTEMPTS = 2
 
 
 def _resolve_spawn_executable():
-    """Return a real python interpreter for multiprocessing 'spawn'.
+    """Return the venv python for multiprocessing 'spawn'.
 
-    Inside a py2app bundle sys.executable is the app stub (Contents/MacOS/
-    VoiceDictation), so spawning re-launches the APP as the child -- it dies
-    instantly and no capture child ever comes up. py2app ships a python symlink
-    next to the stub for exactly this; prefer it. Fall back to sys.executable
-    when it already looks like an interpreter (the plain CLI / dev case)."""
-    exe = sys.executable or ""
-    base = os.path.basename(exe).lower()
-    if "python" in base:
-        return exe
-    sibling = os.path.join(os.path.dirname(exe), "python")
-    if os.path.exists(sibling):
-        return sibling
-    return exe
+    Inside the py2app alias bundle sys.executable is bare Homebrew python3.12,
+    which lacks this project's venv site-packages -- a child spawned there dies
+    with ModuleNotFoundError (numpy/sounddevice) and every take then aborts as
+    device_wedged. The interpreter that actually has the deps is the venv python,
+    which sits at a fixed path relative to this source file (src/audio.py ->
+    ../venv/bin/python). Prefer it; fall back to sys.executable only if it is
+    somehow absent (non-venv dev run)."""
+    venv_python = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "venv",
+                     "bin", "python")
+    )
+    if os.path.exists(venv_python):
+        return venv_python
+    return sys.executable or venv_python
 
 
 class Recorder:
