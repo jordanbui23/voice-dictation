@@ -1,47 +1,64 @@
 """Push-to-talk audio capture via an isolated subprocess. 16kHz mono float32.
 
-The sounddevice InputStream runs in a child process (audio_capture_child.py), NOT
-in this process. Frames cross into the parent through a preallocated shared-memory
-ring; the child signals new write positions over a control pipe. This process only
-copies float32 samples out of the ring -- it never touches PortAudio -- so a wedged
-native CoreAudio call can no longer hang or poison THIS process. Recovery is a
-SIGKILL + respawn of the child, which is the only thing that reliably frees a mic
-device stuck in a native abort()/close(); killing a process reclaims the device via
-the OS instead of racing a live native pointer (which an in-process sd._terminate()
-would do -> use-after-free -> segfault).
+The sounddevice InputStream runs in a child process launched with subprocess.Popen
+(a fresh exec of audio_capture_child.py), NOT via multiprocessing. In a pyobjc/
+py2app bundle neither multiprocessing start method works: spawn re-runs the app's
+main module in the child (FileNotFoundError), and fork after the Obj-C runtime is
+initialized crashes the child instantly. A plain Popen of a standalone script
+sidesteps both. This process only reads float32 bytes off a socket -- it never
+touches PortAudio -- so a wedged native CoreAudio call can no longer hang or poison
+THIS process. Recovery is SIGKILL + respawn of the child, which frees the mic device
+via the OS instead of racing a live native pointer (an in-process sd._terminate()
+would -> use-after-free -> segfault).
 
 API preserved for streaming.py / app.py:
-- start()      -> bool: begin capture. False if the device could not be brought up
-                  (child wedged / respawn failed) so the caller aborts the take.
+- start()      -> bool: begin capture. False if the child could not be brought up
+                  (wedged / spawn failed) so the caller aborts the take.
 - snapshot()   -> 1-D float32 of audio-so-far, WITHOUT stopping (streaming mode).
 - stop()       -> 1-D float32 of the whole take (empty if nothing captured).
 - diagnostics(audio) -> dict for logging (captured_s vs hold_s, peak/rms, flags).
 """
-import multiprocessing as mp
+import os
+import socket
+import struct
+import subprocess
+import sys
 import threading
 import time
 
 import numpy as np
 
 DEFAULT_SAMPLE_RATE = 16000
-RING_SECONDS = 300
 HEALTH_CHECK_S = 0.3
 RESPAWN_ATTEMPTS = 2
+READY_TIMEOUT_S = 3.0
+
+
+def _venv_python():
+    """Absolute path to the venv interpreter (which has numpy + sounddevice).
+
+    sys.executable is unreliable in the bundle (app stub / bare Homebrew python
+    without the venv site-packages). The venv python sits at a fixed path relative
+    to this source file: src/audio.py -> ../venv/bin/python. realpath-resolve so a
+    symlinked bundle path still lands on the interpreter."""
+    p = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "venv",
+                     "bin", "python")
+    )
+    if os.path.exists(p):
+        return p
+    return sys.executable
 
 
 class Recorder:
     def __init__(self, sample_rate=DEFAULT_SAMPLE_RATE, on_no_callbacks=None,
                  health_check_s=HEALTH_CHECK_S):
         self.sample_rate = sample_rate
-        self._ring_samples = int(RING_SECONDS * sample_rate)
         self._on_no_callbacks = on_no_callbacks
         self._health_check_s = health_check_s
 
-        self._ctx = mp.get_context("fork")
         self._lock = threading.Lock()
         self._frames = []
-        self._read_index = 0
-        self._write_index = 0
         self._callback_count = 0
         self._status_flags = []
         self._start_time = None
@@ -49,138 +66,144 @@ class Recorder:
         self._generation = 0
 
         self._proc = None
-        self._conn = None
-        self._shm = None
-        self._ring = None
-        self._pump_thread = None
+        self._sock = None
+        self._reader_thread = None
 
     def _spawn_child(self):
-        """Create shared memory + child process. Returns True once child is READY."""
-        from multiprocessing import shared_memory
+        """Popen the capture child over an AF_UNIX socketpair. True once READY.
 
+        The parent keeps one socket end; the other is passed to the child via
+        pass_fds and its integer fd handed on argv. A reader thread demultiplexes
+        the child's framed stream (control messages + audio) into shared state."""
+        parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        child_fd = child_sock.fileno()
+        child_dir = os.path.dirname(os.path.abspath(__file__))
         try:
-            shm = shared_memory.SharedMemory(
-                create=True, size=self._ring_samples * 4
+            proc = subprocess.Popen(
+                [_venv_python(), "-m", "audio_capture_child",
+                 str(child_fd), str(self.sample_rate)],
+                cwd=child_dir,
+                pass_fds=(child_fd,),
+                stderr=subprocess.DEVNULL,
             )
         except Exception:
+            parent_sock.close()
+            child_sock.close()
             return False
-        ring = np.ndarray((self._ring_samples,), dtype=np.float32, buffer=shm.buf)
-        parent_conn, child_conn = self._ctx.Pipe()
-        proc = self._ctx.Process(
-            target=_child_entry,
-            args=(shm.name, self._ring_samples, self.sample_rate, child_conn),
-            daemon=True,
+        child_sock.close()  # only the child needs its end
+
+        with self._lock:
+            generation = self._generation
+        reader = threading.Thread(
+            target=self._reader, args=(generation, parent_sock), daemon=True
         )
-        proc.start()
-        child_conn.close()
 
-        ready = False
-        deadline = time.time() + 2.0
-        while time.time() < deadline:
-            if parent_conn.poll(deadline - time.time()):
-                try:
-                    msg = parent_conn.recv()
-                except EOFError:
-                    break
-                if msg and msg[0] == "READY":
-                    ready = True
-                    break
-                if msg and msg[0] == "ERROR":
-                    break
-            else:
-                break
+        ready = self._await_ready(parent_sock, proc)
         if not ready:
-            self._kill_child(proc, parent_conn, shm)
+            self._kill_child(proc, parent_sock)
             return False
 
-        self._proc, self._conn, self._shm, self._ring = proc, parent_conn, shm, ring
+        with self._lock:
+            self._proc, self._sock = proc, parent_sock
+            self._reader_thread = reader
+        reader.start()
         return True
 
-    def _kill_child(self, proc=None, conn=None, shm=None):
-        proc = proc if proc is not None else self._proc
-        conn = conn if conn is not None else self._conn
-        shm = shm if shm is not None else self._shm
-        is_current = proc is self._proc
-        if proc is not None and proc.is_alive():
-            proc.kill()
-            proc.join(1.0)
-        if conn is not None:
+    def _await_ready(self, sock, proc):
+        """Block until the child's first framed control message is ('READY').
+
+        Runs on the caller's thread BEFORE the reader thread starts, so it reads
+        the socket directly. A control frame is b"C" + kind + payload; kind b"READY"
+        means the stream is live, b"E" means the child errored during startup."""
+        sock.settimeout(READY_TIMEOUT_S)
+        try:
+            frame = _recv_frame(sock)
+        except (OSError, _FrameError):
+            frame = None
+        finally:
             try:
-                conn.close()
+                sock.settimeout(None)
+            except OSError:
+                pass
+        if not frame or frame[:1] != b"C":
+            return False
+        kind = frame[1:]
+        if kind == b"READY":
+            return True
+        if kind[:1] == b"E":
+            with self._lock:
+                self._status_flags.append(
+                    "child_error:" + kind[1:].decode("utf-8", "replace")
+                )
+        return False
+
+    def _kill_child(self, proc=None, sock=None):
+        proc = proc if proc is not None else self._proc
+        sock = sock if sock is not None else self._sock
+        is_current = proc is self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
             except Exception:
                 pass
-        if shm is not None:
             try:
-                shm.close()
-                shm.unlink()
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+        if sock is not None:
+            try:
+                sock.close()
             except Exception:
                 pass
         if is_current:
-            self._proc = self._conn = self._shm = self._ring = None
+            self._proc = self._sock = None
 
-    def _pump(self, generation, conn):
-        """Drain control-pipe messages into shared state until generation changes.
+    def _reader(self, generation, sock):
+        """Demux the child's framed stream into shared state until generation ends.
 
-        Advancing _write_index here (never in snapshot/stop) means a late message
-        from a killed child's generation is ignored: the guard drops any message
-        once _generation has moved on, so a respawned child cannot have its frames
-        corrupted by the dead one.
-        """
+        Audio frames (b"F" + callback_count + float32 bytes) append to _frames and
+        bump _callback_count. Control frames (b"C" + kind ...) record status flags.
+        The generation guard drops everything once _generation has moved on, so a
+        killed child's late frames can never corrupt a respawned child's buffer."""
         while True:
             with self._lock:
                 if generation != self._generation:
                     return
             try:
-                if not conn.poll(0.2):
-                    continue
-                msg = conn.recv()
-            except (EOFError, OSError):
+                frame = _recv_frame(sock)
+            except (OSError, _FrameError):
                 return
+            if frame is None:  # EOF: child exited
+                return
+            tag = frame[:1]
             with self._lock:
                 if generation != self._generation:
                     return
-                tag = msg[0]
-                if tag == "F":
-                    self._write_index = msg[1]
-                    self._callback_count = msg[2]
-                elif tag == "S":
-                    self._status_flags.append(msg[1])
-                elif tag == "ERROR":
-                    self._status_flags.append(f"child_error:{msg[1]}")
-
-    def _drain_ring(self):
-        """Copy [read_index, write_index) out of the ring into _frames. Caller
-        holds _lock. Handles wrap; flags an overrun if the unread span exceeds the
-        ring (should never happen at 0.5s drain cadence with a 5-min ring)."""
-        if self._ring is None:
-            return
-        write = self._write_index
-        avail = write - self._read_index
-        if avail <= 0:
-            return
-        if avail > self._ring_samples:
-            self._status_flags.append("ring_overrun")
-            self._read_index = write - self._ring_samples
-            avail = self._ring_samples
-        start = self._read_index % self._ring_samples
-        end = start + avail
-        if end <= self._ring_samples:
-            self._frames.append(self._ring[start:end].copy())
-        else:
-            first = self._ring_samples - start
-            self._frames.append(self._ring[start:].copy())
-            self._frames.append(self._ring[: avail - first].copy())
-        self._read_index = write
+                if tag == b"F":
+                    self._callback_count = struct.unpack(">I", frame[1:5])[0]
+                    samples = np.frombuffer(frame[5:], dtype=np.float32)
+                    if samples.size:
+                        self._frames.append(samples.copy())
+                elif tag == b"C":
+                    kind = frame[1:]
+                    if kind[:1] == b"S":
+                        self._status_flags.append(
+                            kind[1:].decode("utf-8", "replace")
+                        )
+                    elif kind[:1] == b"E":
+                        self._status_flags.append(
+                            "child_error:" + kind[1:].decode("utf-8", "replace")
+                        )
 
     def _watchdog(self, generation):
         """Detect a child that started but delivers no frames, and respawn it.
 
-        A wedged mic device is exactly the case where the fresh InputStream opens
-        but never fires a callback, so no ("F", ...) ever arrives and callback_count
-        stays 0. After health_check_s with no frames, SIGKILL the child (freeing the
-        device) and respawn, preserving the parent-held _frames buffer so audio
-        captured before a mid-record wedge survives. If frames never come back,
-        notify the app so the user re-holds instead of losing the take silently.
+        A wedged mic device is exactly the case where the child's InputStream opens
+        but never fires a callback, so no audio frame ever arrives and
+        _callback_count stays 0. After health_check_s with no frames, SIGKILL the
+        child (freeing the device) and respawn, preserving the parent-held _frames
+        buffer so audio captured before a mid-record wedge survives. If frames never
+        come back, notify the app so the user re-holds instead of losing the take.
         """
         for attempt in range(RESPAWN_ATTEMPTS + 1):
             time.sleep(self._health_check_s)
@@ -193,12 +216,11 @@ class Recorder:
             if attempt == RESPAWN_ATTEMPTS:
                 break
             self._kill_child()
-            if not self._spawn_child():
-                continue
             with self._lock:
                 if generation != self._generation:
                     return
-                self._resume_child()
+            if not self._spawn_child():
+                continue
 
         with self._lock:
             still_dead = self._callback_count == 0 and generation == self._generation
@@ -208,21 +230,11 @@ class Recorder:
             except Exception:
                 pass
 
-    def _resume_child(self):
-        """Start the pump thread for the current child. Caller holds _lock."""
-        conn, gen = self._conn, self._generation
-        self._pump_thread = threading.Thread(
-            target=self._pump, args=(gen, conn), daemon=True
-        )
-        self._pump_thread.start()
-
     def start(self):
         if self._proc is not None:
             self._kill_child()
         with self._lock:
             self._frames = []
-            self._read_index = 0
-            self._write_index = 0
             self._callback_count = 0
             self._status_flags = []
             self._generation += 1
@@ -230,7 +242,8 @@ class Recorder:
         self._start_time = time.time()
         if not self._spawn_child():
             with self._lock:
-                self._status_flags = ["child_spawn_failed"]
+                if not self._status_flags:
+                    self._status_flags = ["child_spawn_failed"]
             if self._on_no_callbacks is not None:
                 try:
                     self._on_no_callbacks()
@@ -239,7 +252,6 @@ class Recorder:
             return False
         with self._lock:
             self._recording = True
-            self._resume_child()
         threading.Thread(
             target=self._watchdog, args=(generation,), daemon=True
         ).start()
@@ -248,7 +260,6 @@ class Recorder:
     def snapshot(self):
         """Return audio captured so far as 1-D float32, WITHOUT stopping capture."""
         with self._lock:
-            self._drain_ring()
             if not self._frames:
                 return np.zeros(0, dtype=np.float32)
             return np.concatenate(self._frames, axis=0).reshape(-1).astype(np.float32)
@@ -256,20 +267,20 @@ class Recorder:
     def stop(self):
         """Stop capture, return 1-D float32 mono array (empty if nothing recorded).
 
-        Frames are drained from the ring BEFORE the child is killed, so the whole
-        take is preserved even if the child was mid-callback.
+        The reader thread has been appending frames to _frames as they arrive, so
+        the whole take is already in hand; we just snapshot it, then kill the child.
         """
         with self._lock:
-            self._drain_ring()
             frames = list(self._frames)
             self._frames = []
             if self._callback_count == 0 and self._start_time is not None:
                 self._status_flags.append("no_callbacks_at_stop")
             self._recording = False
             self._generation += 1
-        if self._conn is not None:
+            sock = self._sock
+        if sock is not None:
             try:
-                self._conn.send("stop")
+                sock.sendall(b"stop\n")
             except Exception:
                 pass
         self._kill_child()
@@ -298,7 +309,30 @@ class Recorder:
         }
 
 
-def _child_entry(shm_name, ring_samples, sample_rate, conn):
-    from audio_capture_child import run
+class _FrameError(Exception):
+    pass
 
-    run(shm_name, ring_samples, sample_rate, conn)
+
+def _recv_exactly(sock, n):
+    """Read exactly n bytes, or None on clean EOF. Loops over partial reads."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _recv_frame(sock):
+    """Read one length-prefixed frame. Returns bytes, or None on EOF."""
+    header = _recv_exactly(sock, 4)
+    if header is None:
+        return None
+    (length,) = struct.unpack(">I", header)
+    if length == 0:
+        return b""
+    payload = _recv_exactly(sock, length)
+    if payload is None:
+        return None
+    return payload

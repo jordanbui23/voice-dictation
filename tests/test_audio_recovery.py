@@ -1,11 +1,17 @@
-"""Recovery tests for the subprocess-isolated Recorder.
+"""Recovery + transport tests for the subprocess-isolated Recorder.
 
-We cannot drive a real CoreAudio wedge deterministically, so these tests replace
-the child-spawn + control-pipe with an in-process fake whose frame delivery we
-control. That lets us assert the PARENT's contract:
-  - normal frames -> snapshot()/stop() return the captured audio
-  - no frames at start -> watchdog respawns, then escalates via on_no_callbacks
-  - frames stop mid-record -> parent keeps already-captured audio (salvage)
+Two layers:
+
+1. Real transport (test_real_child_*): spawn the ACTUAL audio_capture_child via a
+   real socketpair, but point sounddevice at a dummy so no mic is needed. Proves the
+   real Popen + framing + reader-thread path delivers frames to the parent -- the
+   layer three prior fixes broke without any test catching it.
+
+2. Recovery logic (test_no_frames_*, test_*_salvage): fake at the _spawn_child level
+   so we can deterministically simulate a wedged child (no frames) and a mid-record
+   wedge, and assert respawn / escalation / salvage. Frames are injected the same way
+   the real reader thread does: appended to rec._frames under rec._lock + generation
+   guard.
 
 Run: ./venv/bin/python tests/test_audio_recovery.py
 """
@@ -18,27 +24,24 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-import audio as audio_mod
 from audio import Recorder
 
 
 class FakeChild:
-    """Stands in for the capture subprocess. Writes frames straight into the
-    parent's ring and advances the parent's _write_index/_callback_count the same
-    way the real _pump would, under the parent's lock and generation guard."""
+    """Feeds frames into the parent exactly as the real reader thread does:
+    append float32 to rec._frames and bump rec._callback_count, under the lock and
+    generation guard. No sockets -- this fakes the post-transport delivery."""
 
-    def __init__(self, rec, frames_per_tick=160, deliver=True):
+    def __init__(self, rec, samples_per_tick=160, deliver=True):
         self.rec = rec
-        self.frames_per_tick = frames_per_tick
+        self.samples_per_tick = samples_per_tick
         self.deliver = deliver
         self._stop = threading.Event()
-        self._thread = None
         self.generation = None
 
     def start(self):
         self.generation = self.rec._generation
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        threading.Thread(target=self._run, daemon=True).start()
 
     def stop_delivering(self):
         self.deliver = False
@@ -50,17 +53,9 @@ class FakeChild:
                 with rec._lock:
                     if self.generation != rec._generation:
                         return
-                    w = rec._write_index % rec._ring_samples
-                    n = self.frames_per_tick
-                    chunk = np.full(n, 0.05, dtype=np.float32)
-                    end = w + n
-                    if end <= rec._ring_samples:
-                        rec._ring[w:end] = chunk
-                    else:
-                        first = rec._ring_samples - w
-                        rec._ring[w:] = chunk[:first]
-                        rec._ring[: n - first] = chunk[first:]
-                    rec._write_index += n
+                    rec._frames.append(
+                        np.full(self.samples_per_tick, 0.05, dtype=np.float32)
+                    )
                     rec._callback_count += 1
             time.sleep(0.02)
 
@@ -68,34 +63,96 @@ class FakeChild:
         self._stop.set()
 
 
-def _install_fake(rec, deliver=True, container=None):
-    """Patch rec._spawn_child to attach a FakeChild instead of a real process.
-    Allocates the ring in-process (no shared_memory needed for the fake)."""
+def _install_fake(rec, deliver=True):
     def fake_spawn():
-        rec._ring = np.zeros(rec._ring_samples, dtype=np.float32)
         rec._proc = object()
-        rec._conn = None
-        rec._shm = None
+        rec._sock = None
         child = FakeChild(rec, deliver=deliver)
-        if container is not None:
-            container.append(child)
         rec._active_fake = child
         child.start()
         return True
 
-    def fake_kill(proc=None, conn=None, shm=None):
+    def fake_kill(proc=None, sock=None):
         fake = getattr(rec, "_active_fake", None)
         if fake is not None:
             fake.kill()
-        rec._proc = rec._conn = rec._shm = rec._ring = None
+        rec._proc = rec._sock = None
         rec._active_fake = None
-
-    def fake_resume():
-        pass  # the FakeChild writes shared state directly; no pump needed
 
     rec._spawn_child = fake_spawn
     rec._kill_child = fake_kill
-    rec._resume_child = fake_resume
+
+
+def test_real_child_delivers_frames():
+    """Spawn the REAL child subprocess over a REAL socketpair; sounddevice is
+    replaced with a dummy that fires the capture callback on a timer, so no mic is
+    needed. Asserts frames actually cross the socket into the parent's _frames."""
+    import subprocess
+    import textwrap
+
+    src = os.path.join(os.path.dirname(__file__), "..", "src")
+    venv_py = os.path.join(src, "..", "venv", "bin", "python")
+    # A shim that makes `import sounddevice` return a dummy InputStream driving the
+    # callback with synthetic audio -- installed via a sitecustomize on PYTHONPATH.
+    shim_dir = os.path.join(os.path.dirname(__file__), "_shim")
+    os.makedirs(shim_dir, exist_ok=True)
+    with open(os.path.join(shim_dir, "sitecustomize.py"), "w") as f:
+        f.write(textwrap.dedent("""
+            import sys, threading, time, types
+            import numpy as np
+            sd = types.ModuleType("sounddevice")
+            class _Default: device = [0, 0]
+            sd.default = _Default()
+            class InputStream:
+                def __init__(self, samplerate, channels, dtype, device, latency, callback):
+                    self._cb = callback; self._stop = threading.Event()
+                def start(self):
+                    def run():
+                        while not self._stop.is_set():
+                            self._cb(np.full((160,1), 0.05, dtype=np.float32), 160, None, None)
+                            time.sleep(0.01)
+                    threading.Thread(target=run, daemon=True).start()
+                def abort(self): self._stop.set()
+                def close(self): self._stop.set()
+            sd.InputStream = InputStream
+            sys.modules["sounddevice"] = sd
+        """))
+
+    rec = Recorder(sample_rate=16000)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = shim_dir + os.pathsep + env.get("PYTHONPATH", "")
+
+    import socket
+    orig_spawn = rec._spawn_child
+
+    def spawn_with_shim():
+        parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        proc = subprocess.Popen(
+            [os.path.abspath(venv_py), "-m", "audio_capture_child",
+             str(child_sock.fileno()), "16000"],
+            cwd=os.path.abspath(src), pass_fds=(child_sock.fileno(),),
+            stderr=subprocess.PIPE, env=env,
+        )
+        child_sock.close()
+        with rec._lock:
+            generation = rec._generation
+        reader = threading.Thread(target=rec._reader, args=(generation, parent_sock),
+                                  daemon=True)
+        if not rec._await_ready(parent_sock, proc):
+            err = proc.stderr.read().decode() if proc.stderr else ""
+            rec._kill_child(proc, parent_sock)
+            raise AssertionError(f"child never READY. stderr:\n{err}")
+        with rec._lock:
+            rec._proc, rec._sock = proc, parent_sock
+        reader.start()
+        return True
+
+    rec._spawn_child = spawn_with_shim
+    assert rec.start() is True, "real child failed to start"
+    time.sleep(0.4)
+    audio = rec.stop()
+    assert audio.size > 0, "no frames crossed the real socket from the real child"
+    print(f"  real_child_delivers_frames: {audio.size} samples over real socket OK")
 
 
 def test_normal_capture():
@@ -103,8 +160,7 @@ def test_normal_capture():
     _install_fake(rec, deliver=True)
     assert rec.start() is True
     time.sleep(0.3)
-    snap = rec.snapshot()
-    assert snap.size > 0, "expected frames from a healthy child"
+    assert rec.snapshot().size > 0, "expected frames from a healthy child"
     audio = rec.stop()
     assert audio.size > 0, "stop() must return captured audio"
     print(f"  normal_capture: captured {audio.size} samples OK")
@@ -118,55 +174,36 @@ def test_no_frames_escalates():
     assert rec.start() is True
     time.sleep(0.6)  # allow watchdog respawn attempts + escalation
     assert escalated, "watchdog must fire on_no_callbacks when no frames ever arrive"
-    audio = rec.stop()
+    rec.stop()
     assert "no_callbacks_at_stop" in rec._status_flags
     print(f"  no_frames_escalates: escalated={len(escalated)} flags={rec._status_flags[:3]} OK")
 
 
 def test_midrecord_salvage():
+    """Frames captured before a mid-record wedge must survive stop()."""
     rec = Recorder(sample_rate=16000, health_check_s=0.05)
     _install_fake(rec, deliver=True)
     assert rec.start() is True
     time.sleep(0.3)
-    before = rec.snapshot().size
-    assert before > 0
-    rec._active_fake.stop_delivering()  # simulate mid-record wedge
-    time.sleep(0.2)
-    audio = rec.stop()
-    assert audio.size >= before, (
-        f"salvage failed: had {before} samples pre-wedge, stop() returned {audio.size}"
-    )
-    print(f"  midrecord_salvage: pre-wedge={before} salvaged={audio.size} OK")
-
-
-def test_stop_drains_undrained_ring():
-    """The salvage guarantee that matters: frames written to the ring but NEVER
-    pulled by a snapshot() must still be returned by stop(). Streaming calls
-    snapshot() so the ring stays near-empty, but batch mode calls ONLY stop() --
-    every captured sample is undrained until then. This is the path that goes red
-    if stop() stops draining before killing the child."""
-    rec = Recorder(sample_rate=16000, health_check_s=0.05)
-    _install_fake(rec, deliver=True)
-    assert rec.start() is True
-    time.sleep(0.3)  # frames accumulate in the ring; NO snapshot() call
     with rec._lock:
-        undrained = rec._write_index - rec._read_index
-    assert undrained > 0, "expected undrained frames in the ring before stop()"
+        captured = sum(f.size for f in rec._frames)
+    assert captured > 0
+    rec._active_fake.stop_delivering()  # simulate mid-record wedge
+    time.sleep(0.1)
     audio = rec.stop()
-    assert audio.size >= undrained, (
-        f"stop() must salvage the undrained ring: {undrained} pending, "
-        f"got {audio.size}"
+    assert audio.size >= captured, (
+        f"salvage failed: had {captured} samples pre-wedge, stop() returned {audio.size}"
     )
-    print(f"  stop_drains_undrained_ring: pending={undrained} returned={audio.size} OK")
+    print(f"  midrecord_salvage: pre-wedge={captured} salvaged={audio.size} OK")
 
 
 if __name__ == "__main__":
     failures = 0
     cases = [
+        ("test_real_child_delivers_frames", test_real_child_delivers_frames),
         ("test_normal_capture", test_normal_capture),
         ("test_no_frames_escalates", test_no_frames_escalates),
         ("test_midrecord_salvage", test_midrecord_salvage),
-        ("test_stop_drains_undrained_ring", test_stop_drains_undrained_ring),
     ]
     for name, fn in cases:
         try:

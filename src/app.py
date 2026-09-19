@@ -493,7 +493,4 @@ class DictationApp(rumps.App):
 
 
 if __name__ == "__main__":
-    import multiprocessing
-
-    multiprocessing.freeze_support()
     DictationApp().run()
