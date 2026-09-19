@@ -18,6 +18,8 @@ API preserved for streaming.py / app.py:
 - diagnostics(audio) -> dict for logging (captured_s vs hold_s, peak/rms, flags).
 """
 import multiprocessing as mp
+import os
+import sys
 import threading
 import time
 
@@ -29,6 +31,24 @@ HEALTH_CHECK_S = 0.3
 RESPAWN_ATTEMPTS = 2
 
 
+def _resolve_spawn_executable():
+    """Return a real python interpreter for multiprocessing 'spawn'.
+
+    Inside a py2app bundle sys.executable is the app stub (Contents/MacOS/
+    VoiceDictation), so spawning re-launches the APP as the child -- it dies
+    instantly and no capture child ever comes up. py2app ships a python symlink
+    next to the stub for exactly this; prefer it. Fall back to sys.executable
+    when it already looks like an interpreter (the plain CLI / dev case)."""
+    exe = sys.executable or ""
+    base = os.path.basename(exe).lower()
+    if "python" in base:
+        return exe
+    sibling = os.path.join(os.path.dirname(exe), "python")
+    if os.path.exists(sibling):
+        return sibling
+    return exe
+
+
 class Recorder:
     def __init__(self, sample_rate=DEFAULT_SAMPLE_RATE, on_no_callbacks=None,
                  health_check_s=HEALTH_CHECK_S):
@@ -38,6 +58,7 @@ class Recorder:
         self._health_check_s = health_check_s
 
         self._ctx = mp.get_context("spawn")
+        self._ctx.set_executable(_resolve_spawn_executable())
         self._lock = threading.Lock()
         self._frames = []
         self._read_index = 0
