@@ -18,8 +18,6 @@ API preserved for streaming.py / app.py:
 - diagnostics(audio) -> dict for logging (captured_s vs hold_s, peak/rms, flags).
 """
 import multiprocessing as mp
-import os
-import sys
 import threading
 import time
 
@@ -31,25 +29,6 @@ HEALTH_CHECK_S = 0.3
 RESPAWN_ATTEMPTS = 2
 
 
-def _resolve_spawn_executable():
-    """Return the venv python for multiprocessing 'spawn'.
-
-    Inside the py2app alias bundle sys.executable is bare Homebrew python3.12,
-    which lacks this project's venv site-packages -- a child spawned there dies
-    with ModuleNotFoundError (numpy/sounddevice) and every take then aborts as
-    device_wedged. The interpreter that actually has the deps is the venv python,
-    which sits at a fixed path relative to this source file (src/audio.py ->
-    ../venv/bin/python). Prefer it; fall back to sys.executable only if it is
-    somehow absent (non-venv dev run)."""
-    venv_python = os.path.normpath(
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "venv",
-                     "bin", "python")
-    )
-    if os.path.exists(venv_python):
-        return venv_python
-    return sys.executable or venv_python
-
-
 class Recorder:
     def __init__(self, sample_rate=DEFAULT_SAMPLE_RATE, on_no_callbacks=None,
                  health_check_s=HEALTH_CHECK_S):
@@ -58,8 +37,7 @@ class Recorder:
         self._on_no_callbacks = on_no_callbacks
         self._health_check_s = health_check_s
 
-        self._ctx = mp.get_context("spawn")
-        self._ctx.set_executable(_resolve_spawn_executable())
+        self._ctx = mp.get_context("fork")
         self._lock = threading.Lock()
         self._frames = []
         self._read_index = 0
