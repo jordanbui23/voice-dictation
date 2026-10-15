@@ -68,6 +68,7 @@ class DictationApp(rumps.App):
         self.transcriber = Transcriber(
             self.cfg.get("whisper_model"),
             initial_prompt=build_whisper_prompt(self.known_words),
+            metal_cache_limit_gb=self.cfg.get_float("metal_cache_limit_gb"),
         )
         self.cleanup_client = None
         self._recording = False
@@ -192,6 +193,7 @@ class DictationApp(rumps.App):
             new_transcriber = Transcriber(
                 self.cfg.get("whisper_model"),
                 initial_prompt=build_whisper_prompt(self.known_words),
+                metal_cache_limit_gb=self.cfg.get_float("metal_cache_limit_gb"),
             )
             new_transcriber.warm_up()
             self.transcriber = new_transcriber

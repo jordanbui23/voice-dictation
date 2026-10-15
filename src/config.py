@@ -18,6 +18,7 @@ DEFAULTS = {
     "transcribe_timeout_seconds": 60.0,
     "whisper_model": "mlx-community/whisper-base-mlx",
     "whisper_model_label": "base",
+    "metal_cache_limit_gb": 1.0,
     "hotkey": "right_cmd",
     "sample_rate": 16000,
     "clipboard_restore_delay": 0.25,

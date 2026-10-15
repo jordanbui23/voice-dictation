@@ -5,14 +5,18 @@ import numpy as np
 
 
 class Transcriber:
-    def __init__(self, model_repo, initial_prompt=""):
+    def __init__(self, model_repo, initial_prompt="", metal_cache_limit_gb=1.0):
         self.model_repo = model_repo
         self.initial_prompt = initial_prompt or ""
+        self.metal_cache_limit_gb = metal_cache_limit_gb
         self._mlx = None
 
     def _lazy(self):
         if self._mlx is None:
+            import mlx.core as mx
             import mlx_whisper
+            if self.metal_cache_limit_gb is not None:
+                mx.set_cache_limit(int(self.metal_cache_limit_gb * 1024 ** 3))
             self._mlx = mlx_whisper
         return self._mlx
 
