@@ -22,7 +22,8 @@ browser). Runs two ways depending on the cleanup toggle: a polished **batch** mo
 - **Stage 1 (transcription) runs 100% locally** via `mlx-whisper` (Metal). **Audio
   never leaves the machine**, in either mode.
 - **Stage 2 (Bedrock cleanup)** sends **only the raw transcript text** (never audio)
-  to Bedrock for grammar/punctuation fixes and technical-term correction. Toggleable.
+  to Bedrock for punctuation, capitalization, run-on splitting, and technical-term
+  correction. Your wording and slang are kept as spoken. Toggleable.
 - **The cleanup toggle also selects the mode:**
   - **Cleanup ON → batch:** transcribe the whole clip on release, clean via Bedrock,
     paste at cursor with the clipboard preserved. Default.
