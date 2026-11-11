@@ -25,6 +25,8 @@ visible duplicates/drops in the user's documents):
 import threading
 import time
 
+from transcribe import collapse_repetitions
+
 DEFAULT_INTERVAL = 0.5
 CONTEXT_PAD_SECONDS = 4.0
 VOLATILE_MARGIN_SECONDS = 1.5
@@ -100,7 +102,7 @@ class StreamingSession:
         return 0
 
     def _commit_words(self, words):
-        text = "".join(w[0] for w in words).strip()
+        text = collapse_repetitions("".join(w[0] for w in words).strip())
         if not text:
             return
         prefix = " " if self._committed_any else ""

@@ -30,7 +30,7 @@ from known_words import apply_corrections, build_whisper_prompt
 from overlay import Overlay
 from paste import paste_text
 from streaming import StreamingSession
-from transcribe import Transcriber
+from transcribe import Transcriber, collapse_repetitions
 from type_text import type_text
 
 IDLE_ICON = "🎙️"
@@ -455,6 +455,7 @@ class DictationApp(rumps.App):
                         )
                 _ = time.time() - t0
 
+            final_text = collapse_repetitions(final_text)
             final_text = apply_corrections(final_text, self.known_words)
             final_text = strip_dashes(final_text)
             self._trace("paste_enter", cleanup=used_cleanup)

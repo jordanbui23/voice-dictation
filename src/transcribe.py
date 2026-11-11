@@ -1,7 +1,62 @@
 """Local Whisper transcription via mlx-whisper (Apple Silicon Metal). Audio never leaves the Mac."""
+import re
 import threading
 
 import numpy as np
+
+_TOKEN_RE = re.compile(r"\s+")
+
+
+def _collapse_exact_ngrams(tokens, max_repeats, max_ngram):
+    """Collapse an exact token n-gram repeated more than max_repeats times in a row."""
+    for n in range(1, max_ngram + 1):
+        if len(tokens) < n * (max_repeats + 1):
+            continue
+        out = []
+        i = 0
+        while i < len(tokens):
+            gram = tokens[i:i + n]
+            if len(gram) < n:
+                out.extend(gram)
+                break
+            reps = 1
+            j = i + n
+            while j + n <= len(tokens) and tokens[j:j + n] == gram:
+                reps += 1
+                j += n
+            if reps > max_repeats:
+                out.extend(gram)
+                i = j
+            else:
+                out.append(tokens[i])
+                i += 1
+        tokens = out
+    return tokens
+
+
+def collapse_repetitions(text, max_repeats=3, max_ngram=5):
+    """Collapse a token n-gram repeated more than max_repeats times in a row.
+
+    Whisper degenerates into repetition loops (e.g. 'Cat, Hanhee, Cat, Hanhee,
+    ...' x40) on ambiguous or quiet audio. This local guard runs before paste in
+    both batch and streaming modes, independent of the Bedrock cleanup stage, so
+    the loop never reaches the cursor even when cleanup is off or falls back to raw.
+
+    Deliberately conservative: only an EXACT n-gram repeated beyond max_repeats is
+    collapsed, so a genuine emphatic repetition in real speech ('no no no you should
+    get the perm') is preserved. A substitution-tolerant pass was tried and rejected
+    for corrupting real speech while still missing exotic interleaved loops; the
+    Bedrock cleanup stage handles the residual when enabled.
+
+    Order-preserving; a phrase repeated up to max_repeats times is left untouched.
+    """
+    if not text:
+        return text
+    tokens = _TOKEN_RE.split(text.strip())
+    if len(tokens) <= max_repeats:
+        return text
+    tokens = _collapse_exact_ngrams(tokens, max_repeats, max_ngram)
+    return " ".join(tokens)
 
 
 class Transcriber:
