@@ -27,7 +27,10 @@ DEFAULTS = {
     "known_words": [
         {"correct": "Dhimu", "sounds_like": ["demu", "dee moo", "the moo"]},
         {"correct": "Cat", "sounds_like": ["kat"]},
-        {"correct": "Kathryn", "sounds_like": ["catherine", "katherine"]},
+        {"correct": "Kathryn", "sounds_like": ["catherine", "katherine", "kathern"]},
+        {"correct": "Bat", "sounds_like": ["bot"]},
+        {"correct": "Hanhee", "sounds_like": ["honey", "han hee", "hanni", "hani", "hanhi"]},
+        {"correct": "Haijia", "sounds_like": ["high jia", "hi jia", "haija", "hija", "hi ja", "high ja", "hajja", "hyja"]},
     ],
 }
 
@@ -95,12 +98,13 @@ class Config:
             self.save()
 
     def get_known_words(self):
-        """Return the known-words vocabulary list, filtered to valid entries."""
-        raw = self._data.get("known_words", DEFAULTS["known_words"])
-        if not isinstance(raw, list):
-            return []
-        out = []
-        for entry in raw:
+        """Return DEFAULTS and config.json vocabulary merged by spelling, with
+        sounds_like variants unioned, so neither list silently hides the other."""
+        saved = self._data.get("known_words", [])
+        if not isinstance(saved, list):
+            saved = []
+        merged = {}
+        for entry in [*DEFAULTS["known_words"], *saved]:
             if not isinstance(entry, dict):
                 continue
             correct = str(entry.get("correct", "")).strip()
@@ -109,8 +113,10 @@ class Config:
             sounds = entry.get("sounds_like", [])
             if not isinstance(sounds, list):
                 sounds = []
-            out.append({
-                "correct": correct,
-                "sounds_like": [str(s).strip() for s in sounds if str(s).strip()],
-            })
-        return out
+            slot = merged.setdefault(correct.lower(), {"correct": correct, "sounds_like": []})
+            slot["correct"] = correct
+            for s in sounds:
+                s = str(s).strip()
+                if s and s.lower() not in (v.lower() for v in slot["sounds_like"]):
+                    slot["sounds_like"].append(s)
+        return list(merged.values())
