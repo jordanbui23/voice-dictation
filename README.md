@@ -108,8 +108,10 @@ granting, relaunch the app.
 - **Cleanup (Bedrock)** — toggle Stage 2 on/off. **This also selects the mode:** ON =
   batch + Bedrock polish (paste on release); OFF = live offline streaming (typed as you
   speak).
-- **Whisper Model** — `tiny` / `base` / `small` / `medium`. Bigger = more accurate,
-  slower. Default `base`.
+- **Whisper Model** — `medium` / `distil-large-v3` / `large-v3-turbo`.
+  `distil-large-v3` (English-only) is distilled to resist long-clip hallucination;
+  `large-v3-turbo` keeps the full large-v3 encoder for harder vocabulary and other
+  languages. Default `distil-large-v3`.
 - **Hotkey** — Right Command + Right Option (default), or single Right Command / Right
   Option / Right Control, or F5. A non-modifier key (F5) or the modifier-clearing guard
   keeps held modifiers from corrupting typed text in streaming mode.

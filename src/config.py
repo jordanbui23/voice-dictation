@@ -16,8 +16,8 @@ DEFAULTS = {
     "cleanup_timeout_seconds": 3.0,
     "cleanup_max_tokens": 512,
     "transcribe_timeout_seconds": 60.0,
-    "whisper_model": "mlx-community/whisper-base-mlx",
-    "whisper_model_label": "base",
+    "whisper_model": "mlx-community/distil-whisper-large-v3",
+    "whisper_model_label": "distil-large-v3",
     "metal_cache_limit_gb": 1.0,
     "hotkey": "right_cmd",
     "sample_rate": 16000,
@@ -32,10 +32,9 @@ DEFAULTS = {
 }
 
 WHISPER_MODELS = {
-    "tiny": "mlx-community/whisper-tiny-mlx",
-    "base": "mlx-community/whisper-base-mlx",
-    "small": "mlx-community/whisper-small-mlx",
     "medium": "mlx-community/whisper-medium-mlx",
+    "distil-large-v3": "mlx-community/distil-whisper-large-v3",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
 }
 
 HOTKEYS = [
@@ -63,6 +62,9 @@ class Config:
                     self._data[k] = v
             except (json.JSONDecodeError, OSError):
                 pass
+        if self._data.get("whisper_model_label") not in WHISPER_MODELS:
+            self._data["whisper_model"] = DEFAULTS["whisper_model"]
+            self._data["whisper_model_label"] = DEFAULTS["whisper_model_label"]
         return self
 
     def save(self):

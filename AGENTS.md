@@ -102,6 +102,15 @@ There are no unit tests. Verification = actually dictate and inspect
   - normal `peak`/`rms` but garbage text → **Whisper hallucination** (raise no-speech
     threshold or use a bigger model)
   - short `hold_s` → **early release** (user let go too soon)
+- **`temperature=0.0` and `condition_on_previous_text=False` are deliberate** (`8294d82`):
+  the default 6-step temperature fallback multiplied re-decodes and hung long clips with
+  pauses. Do not restore the fallback tuple without re-testing a long clip with pauses.
+- **If `distil-large-v3` / `large-v3-turbo` still collapse on long clips, the next step is
+  NVIDIA Parakeet TDT 0.6B v2 via `parakeet-mlx`.** It is a non-autoregressive transducer,
+  so it cannot loop or invent phrases the way Whisper's decoder does, and it scores better
+  on English WER. Cost: a second backend beside mlx-whisper, no `initial_prompt` vocabulary
+  hinting (the `sounds_like` corrections still apply), and streaming's word timestamps
+  need rewiring to its timestamp output.
 - Every dictation logs one JSON line to `logs/transcripts.jsonl` (`event: "dictation"`)
   with `raw`, `final`, `cleanup`, `mode`, and the diagnostics fields. Discarded clips
   log `event: "dictation_discarded"` with a `reason`. Inspect this file to debug output.
