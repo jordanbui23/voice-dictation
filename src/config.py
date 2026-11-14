@@ -33,6 +33,7 @@ DEFAULTS = {
         {"correct": "Haijia", "sounds_like": ["high jia", "hi jia", "haija", "hija", "hi ja", "high ja", "hajja", "hyja"]},
         {"correct": "ThuyVy", "sounds_like": ["thuy vy", "thuy vi", "thuyvi", "twee vee", "twee vy", "tweevy", "tui vy", "tui vi"]},
         {"correct": "Vilan", "sounds_like": ["vi lan", "vee lan", "vy lan", "vylan", "villan"]},
+        {"correct": "lowkey", "sounds_like": ["low-key", "lo-key", "low key", "lo key"]},
     ],
 }
 

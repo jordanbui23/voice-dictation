@@ -54,12 +54,19 @@ def _compile(known_words):
     return rules
 
 
+def _replacement(correct):
+    if correct != correct.lower():
+        return correct
+    return lambda m: correct.capitalize() if m.group(0)[:1].isupper() else correct
+
+
 def apply_corrections(text, known_words):
     """Replace known mishearings with their correct spelling. Case-insensitive
-    match, whole-word only, replacement uses the configured correct casing."""
+    match, whole-word only, replacement uses the configured correct casing; an
+    all-lowercase word keeps a capital first letter where the match had one."""
     if not text or not known_words:
         return text
     out = text
     for pattern, correct in _compile(known_words):
-        out = pattern.sub(correct, out)
+        out = pattern.sub(_replacement(correct), out)
     return out
