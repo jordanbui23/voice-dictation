@@ -31,6 +31,8 @@ DEFAULTS = {
         {"correct": "Bat", "sounds_like": ["bot"]},
         {"correct": "Hanhee", "sounds_like": ["honey", "han hee", "hanni", "hani", "hanhi"]},
         {"correct": "Haijia", "sounds_like": ["high jia", "hi jia", "haija", "hija", "hi ja", "high ja", "hajja", "hyja"]},
+        {"correct": "ThuyVy", "sounds_like": ["thuy vy", "thuy vi", "thuyvi", "twee vee", "twee vy", "tweevy", "tui vy", "tui vi"]},
+        {"correct": "Vilan", "sounds_like": ["vi lan", "vee lan", "vy lan", "vylan", "villan"]},
     ],
 }
 
