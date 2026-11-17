@@ -8,3 +8,4 @@ logs/*.jsonl
 config.json
 .DS_Store
 tests/_shim/
+logs/audio/

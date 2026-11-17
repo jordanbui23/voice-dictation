@@ -146,6 +146,7 @@ class StreamingSession:
         if self._thread is not None:
             self._thread.join(timeout=3.0)
         audio = self.recorder.stop()
+        self.audio = audio
         self.diagnostics = self.recorder.diagnostics(audio)
         if audio.size < self.sample_rate * 0.2:
             return self._full_text

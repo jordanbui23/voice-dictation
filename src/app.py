@@ -23,6 +23,7 @@ import rumps
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from audio import Recorder
+from audio_archive import save_clip
 from bedrock_cleanup import BedrockCleanup, is_auth_error
 from config import Config, WHISPER_MODELS, HOTKEYS, LOG_DIR, STREAM_DEBUG_LOG
 from hotkey import HotkeyListener
@@ -386,6 +387,8 @@ class DictationApp(rumps.App):
                 final=full_text,
                 cleanup=False,
                 mode="stream",
+                model=self.cfg.get("whisper_model_label"),
+                audio_file=self._archive(getattr(session, "audio", None)),
                 **session.diagnostics,
             )
         except Exception as e:
@@ -416,10 +419,13 @@ class DictationApp(rumps.App):
                 return
 
             self._trace("transcribe_enter")
+            audio_file = self._archive(audio)
+            t_transcribe = time.time()
             try:
                 raw = self.transcriber.transcribe_with_timeout(
                     audio, self.cfg.get_float("transcribe_timeout_seconds")
                 )
+                transcribe_s = round(time.time() - t_transcribe, 3)
                 self._trace("transcribe_return", chars=len(raw) if raw else 0)
             except TimeoutError as e:
                 timed_out = True
@@ -431,13 +437,16 @@ class DictationApp(rumps.App):
                 )
                 return
             if not raw:
-                self._log_event("dictation_discarded", reason="empty_transcript", **diag)
+                self._log_event("dictation_discarded", reason="empty_transcript",
+                                model=self.cfg.get("whisper_model_label"),
+                                audio_file=audio_file, **diag)
                 self.overlay.hide()
                 return
 
             final_text = raw
             used_cleanup = False
             cleanup_error = None
+            cleanup_s = None
             auth_needed = False
 
             if self.cfg.get("cleanup_enabled") and self.cleanup_client is not None:
@@ -457,7 +466,7 @@ class DictationApp(rumps.App):
                             "Cleanup unavailable, pasted raw transcript",
                             (str(e)[:120]),
                         )
-                _ = time.time() - t0
+                cleanup_s = round(time.time() - t0, 3)
 
             final_text = collapse_repetitions(final_text)
             final_text = apply_corrections(final_text, self.known_words)
@@ -471,6 +480,10 @@ class DictationApp(rumps.App):
                 final=final_text,
                 cleanup=used_cleanup,
                 cleanup_error=cleanup_error,
+                model=self.cfg.get("whisper_model_label"),
+                transcribe_s=transcribe_s,
+                cleanup_s=cleanup_s,
+                audio_file=audio_file,
                 **diag,
             )
         except Exception as e:
@@ -488,6 +501,17 @@ class DictationApp(rumps.App):
             self._trace("process_exit")
 
     # ---------- logging ----------
+
+    def _archive(self, audio):
+        if not self.cfg.get("save_audio"):
+            return None
+        try:
+            return save_clip(audio, self.cfg.get_int("sample_rate"),
+                             os.path.join(LOG_DIR, "audio"),
+                             self.cfg.get_float("audio_keep_days"))
+        except Exception as e:  # noqa: BLE001 - archiving must never block a paste
+            self._trace("audio_archive_failed", error=str(e)[:200])
+            return None
 
     def _log_event(self, kind, **fields):
         rec = {"ts": datetime.now().isoformat(), "event": kind}

@@ -17,7 +17,10 @@ text lands at the cursor. Two modes, auto-selected by the **Cleanup** toggle:
 
 **Privacy invariant (do not break):** Stage 1 transcription is 100% local (`mlx-whisper`,
 Metal). Audio NEVER leaves the Mac in either mode. Stage 2 (Bedrock) sends **raw
-transcript text only** — never audio — and is toggleable.
+transcript text only** — never audio — and is toggleable. With `save_audio` on (off by
+default), clips are kept locally in gitignored `logs/audio/` for model comparison and
+deleted after `audio_keep_days`; each `dictation` log line names its `audio_file`,
+`model`, `transcribe_s` and `cleanup_s`.
 
 ## Build / run (there is NO test suite — validate by running the app)
 
