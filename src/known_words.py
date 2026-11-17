@@ -17,12 +17,37 @@ import re
 _WORD_BOUNDARY = r"(?<![A-Za-z]){variant}(?![A-Za-z])"
 
 
-def build_whisper_prompt(known_words):
-    """Return a comma-joined vocabulary string for Whisper initial_prompt, or ''."""
-    names = [w["correct"] for w in known_words if w.get("correct")]
+def build_whisper_prompt(known_words, extra_names=()):
+    """Return a short sentence in the speaker's own register naming the custom
+    words, or ''. Whisper treats initial_prompt as the transcript that came just
+    before, so a natural sentence biases spelling and style, while a labelled list
+    ('Vocabulary: ...') gets continued and echoed back as if it were speech."""
+    names = []
+    for name in [*(w.get("correct", "") for w in known_words), *extra_names]:
+        name = name.strip()
+        if name and name[0].isupper() and name not in names:
+            names.append(name)
     if not names:
         return ""
-    return "Vocabulary: " + ", ".join(names) + "."
+    listed = ", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1 else names[0]
+    return (
+        f"Hung out with {listed} today. Lowkey gonna grab boba after, "
+        "it was hella fun."
+    )
+
+
+def _tokens(text):
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def is_prompt_echo(text, prompt, min_tokens=3):
+    """True if text is just a contiguous run of the prompt's own words, which is
+    Whisper regurgitating its initial_prompt on silence rather than speech."""
+    out, src = _tokens(text), _tokens(prompt)
+    if len(out) < min_tokens or not src:
+        return False
+    n = len(out)
+    return any(src[i:i + n] == out for i in range(len(src) - n + 1))
 
 
 def _variants(word):
@@ -54,16 +79,25 @@ def _compile(known_words):
     return rules
 
 
+_SENTENCE_START = re.compile(r"(?:^|[.?!]\s+)$")
+
+
 def _replacement(correct):
     if correct != correct.lower():
         return correct
-    return lambda m: correct.capitalize() if m.group(0)[:1].isupper() else correct
+
+    def sub(m):
+        if _SENTENCE_START.search(m.string[:m.start()]):
+            return correct.capitalize()
+        return correct
+
+    return sub
 
 
 def apply_corrections(text, known_words):
     """Replace known mishearings with their correct spelling. Case-insensitive
     match, whole-word only, replacement uses the configured correct casing; an
-    all-lowercase word keeps a capital first letter where the match had one."""
+    all-lowercase word is capitalized only at the start of a sentence."""
     if not text or not known_words:
         return text
     out = text

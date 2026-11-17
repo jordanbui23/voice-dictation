@@ -4,6 +4,8 @@ import threading
 
 import numpy as np
 
+from known_words import is_prompt_echo
+
 _TOKEN_RE = re.compile(r"\s+")
 
 
@@ -98,7 +100,8 @@ class Transcriber:
             fp16=True,
             **self._decode_kwargs(),
         )
-        return result.get("text", "").strip()
+        text = result.get("text", "").strip()
+        return "" if is_prompt_echo(text, self.initial_prompt) else text
 
     def transcribe_with_timeout(self, audio_f32_mono_16k, timeout_s):
         """Run transcribe on a daemon thread; raise TimeoutError if it exceeds timeout_s.
@@ -150,4 +153,6 @@ class Transcriber:
                 if token.strip():
                     words.append((token, float(w.get("start", 0.0)),
                                   float(w.get("end", 0.0))))
+        if is_prompt_echo("".join(w[0] for w in words), self.initial_prompt):
+            return []
         return words

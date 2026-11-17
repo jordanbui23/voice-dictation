@@ -29,11 +29,19 @@ DEFAULTS = {
         {"correct": "Cat", "sounds_like": ["kat"]},
         {"correct": "Kathryn", "sounds_like": ["catherine", "katherine", "kathern"]},
         {"correct": "Bat", "sounds_like": ["bot"]},
-        {"correct": "Hanhee", "sounds_like": ["honey", "han hee", "hanni", "hani", "hanhi"]},
+        {"correct": "Hanhee", "sounds_like": ["honey", "han hee", "hanni", "hani", "hanhi", "hany", "hanyi", "hanli", "hanha", "hanhe"]},
         {"correct": "Haijia", "sounds_like": ["high jia", "hi jia", "haija", "hija", "hi ja", "high ja", "hajja", "hyja"]},
         {"correct": "ThuyVy", "sounds_like": ["thuy vy", "thuy vi", "thuyvi", "twee vee", "twee vy", "tweevy", "tui vy", "tui vi"]},
         {"correct": "Vilan", "sounds_like": ["vi lan", "vee lan", "vy lan", "vylan", "villan"]},
-        {"correct": "lowkey", "sounds_like": ["low-key", "lo-key", "low key", "lo key"]},
+        {"correct": "lowkey", "sounds_like": ["low-key", "lo-key", "low key", "lo key", "loki"]},
+        {"correct": "Arisa", "sounds_like": ["orisa", "arissa", "aresa"]},
+        {"correct": "Brennan", "sounds_like": ["brendan", "brenan"]},
+        {"correct": "Kenka", "sounds_like": ["kanka", "kenca"]},
+        {"correct": "Haley", "sounds_like": ["hailey", "hayley"]},
+    ],
+    "prompt_names": [
+        "Christian", "Byron", "Vivian", "Jerry", "Thomas", "Ben", "Juliana", "Phil",
+        "Bailey", "YGF", "Shreya", "Avik", "Joanna", "Eugene", "Olivia", "Joyce",
     ],
 }
 

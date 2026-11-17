@@ -67,7 +67,7 @@ class DictationApp(rumps.App):
         )
         self.transcriber = Transcriber(
             self.cfg.get("whisper_model"),
-            initial_prompt=build_whisper_prompt(self.known_words),
+            initial_prompt=self._whisper_prompt(),
             metal_cache_limit_gb=self.cfg.get_float("metal_cache_limit_gb"),
         )
         self.cleanup_client = None
@@ -143,6 +143,10 @@ class DictationApp(rumps.App):
         merged = dirs + [p for p in current if p not in dirs]
         os.environ["PATH"] = os.pathsep.join(merged)
 
+    def _whisper_prompt(self):
+        extra = self.cfg.get("prompt_names")
+        return build_whisper_prompt(self.known_words, extra if isinstance(extra, list) else [])
+
     def _init_cleanup_client(self):
         try:
             self.cleanup_client = BedrockCleanup(
@@ -192,7 +196,7 @@ class DictationApp(rumps.App):
         try:
             new_transcriber = Transcriber(
                 self.cfg.get("whisper_model"),
-                initial_prompt=build_whisper_prompt(self.known_words),
+                initial_prompt=self._whisper_prompt(),
                 metal_cache_limit_gb=self.cfg.get_float("metal_cache_limit_gb"),
             )
             new_transcriber.warm_up()
