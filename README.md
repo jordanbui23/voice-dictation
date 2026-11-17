@@ -117,6 +117,8 @@ granting, relaunch the app.
   Option / Right Control, or F5. A non-modifier key (F5) or the modifier-clearing guard
   keeps held modifiers from corrupting typed text in streaming mode.
 - **Open Log Folder** — transcripts logged to `logs/transcripts.jsonl`.
+  `scripts/judge_transcripts.py` estimates per-model accuracy from those logs by having
+  the cleanup model flag likely mishearings (plausibility only, no audio reference).
 
 Settings persist to `config.json` at the project root. Notable extra keys:
 `stream_interval_seconds` (streaming decode cadence, default 0.5), `stream_debug`
